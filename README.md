@@ -98,7 +98,7 @@ python sv241.py tui --hold-current --csv hub.csv
 | --- | --- |
 | Up/Down, `j`/`k` | select row (7 outputs, ADJ, PWM1, PWM2) |
 | Space / Enter (output row) | toggle; switching **off** asks `y/N` |
-| Left/Right, `-`/`+` | step ADJ 0.5 V, PWM 5 % |
+| Left/Right, `-`/`+` | step ADJ ~0.5 V (8 raw), PWM 5 % (13 raw, capped at 100 %) |
 | `,` / `.` | step 1 raw |
 | `e` / Enter (channel row) | type a value: `12` (V), `40` (%), `raw:120`; Esc cancels |
 | `h` | hold/release the selected channel (re-pushed each poll, like hold mode) |
