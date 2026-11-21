@@ -117,7 +117,9 @@ x = 65535·b4 + 255·((b5 − 2·b4) mod 255) + b6; exact except where x mod 655
 values), where the encoding itself is ambiguous [F, brute-force checked].
 
 A big-endian int32 decode (256·b5 + b6, as the original hold script did) reads high by b5/100:
-about +0.6 °C at 20 °C, +2.2 %RH at 50 %RH, +0.04 V at 12 V.
+about +1.07 °C at 20 °C, +1.19 %RH at 50 %RH, +0.04 V at 12 V. The original script subtracted
+empirical offsets (255.5 for temperatures, 254 for RH) instead of 255, so its net error was about
++0.6 °C and +2.2 %RH.
 
 | Cmd | Firmware source | Unit after decode | Notes |
 | --- | --- | --- | --- |

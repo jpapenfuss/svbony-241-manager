@@ -84,8 +84,9 @@ Protocol (firmware V1.3, disassembly-verified; full reference in docs/PROTOCOL.m
   Exchange is half-duplex: flush input, send one 6-byte frame, read one fixed-length reply.
   Bad frames (wrong checksum) are dropped silently; there is no NAK, only a missing reply.
   Sensor payload b3..b6 is base-255, not base-256: x = ((b3*255 + b4)*255 + b5)*255 + b6,
-  value = x / 100; temperatures and RH carry a +255 offset. (The old big-endian decode read
-  about 0.6 °C and 2.2 %RH high.) The firmware's upper two bytes are not true base-255 digits,
+  value = x / 100; temperatures and RH carry a +255 offset. (The old script's big-endian decode
+  reads high by b5/100; with its empirical -255.5 / -254 offsets that came to about +0.6 °C and
+  +2.2 %RH.) The firmware's upper two bytes are not true base-255 digits,
   but they are 0 for every value this script reads (x < 65025), so the decode is exact here.
   DTR/RTS must be low before the port opens, or the ESP32 resets. The hub sends nothing
   unprompted except its "SV241Pro ..." boot banner, so seeing that means it rebooted.
@@ -141,7 +142,7 @@ CHANNELS = {"adj": 7, "pwm1": 8, "pwm2": 9}                    # hub index for C
 RAW_FULL = 253           # vendor app's 100 % / 15.3 V point
 RAW_MAX = 255            # firmware accepts the full byte range
 ADJ_VMAX = 15.3          # assumed ADJ OUT volts at RAW_FULL (linear scale; unverified on hardware)
-INA_SCALE = 15.57        # vendor app's INA219 current correction (board shunt != library default)
+INA_SCALE = 15.57        # vendor app's INA219 current correction (implies a non-default board shunt)
 PWR_OFFSET_MW = 269.39   # vendor app's fixed power offset (mW)
 COMMANDS = ("status", "sensors", "on", "off", "set", "raw", "ports", "hold", "tui")
 
@@ -259,7 +260,8 @@ def posix_ports():
     """[(device, vid, pid, description)] for USB serial ports, without pyserial.
     Linux: /dev/ttyUSB*, /dev/ttyACM* with VID:PID from sysfs. macOS: /dev/cu.* USB serial nodes
     (Apple's CH34x driver: cu.usbserial-*, WCH's driver: cu.wchusbserial*); VID:PID is not
-    available without pyserial/ioreg, so names that only the WCH/CH34x drivers use count as CH340."""
+    available without pyserial/ioreg, so only cu.wchusbserial* (a name only WCH's driver uses)
+    counts as CH340; cu.usbserial-*/cu.usbmodem* are listed as unidentified USB serial."""
     import glob
     out = []
     if sys.platform.startswith("linux"):
@@ -752,7 +754,8 @@ def rounded(d):
 # ------------------------------------------------------------------------------------------
 # One-shot commands
 # ------------------------------------------------------------------------------------------
-# Each cmd_* handler takes (hub, args) and returns the process exit code; main() maps
+# Each cmd_* handler takes (hub, args) (cmd_ports: args only, no hub) and returns the process
+# exit code; main() maps
 # CommError -> 1 and Refused -> 2 for anything they let escape.
 def print_sensors(s):
     """Human-readable sensors() dict, including the PWM1 cutoff margin when computable."""
@@ -1709,8 +1712,10 @@ def insert_default_command(argv):
 
 
 def main(argv=None, hub_factory=None):
-    """CLI entry point; returns the exit code. Arguments are validated before the port is
-    opened, so a typo never touches the hub. hub_factory replaces Hub (tests/fake_hub.py)."""
+    """CLI entry point; returns the exit code. `set` levels and `on`/`off` names are
+    validated before the port is opened, so those typos never touch the hub. `raw` hex bytes
+    are not pre-validated: a bad one raises ValueError from cmd_raw after the port is open.
+    hub_factory replaces Hub (tests/fake_hub.py)."""
     argv = sys.argv[1:] if argv is None else argv
     a = build_parser().parse_args(insert_default_command(argv))
     try:
