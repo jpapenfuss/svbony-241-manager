@@ -251,6 +251,10 @@ class PosixSerialTests(unittest.TestCase):
         os.close(self.master)
         os.close(self.slave)
 
+    def test_unsupported_baud_is_comm_error(self):
+        with self.assertRaises(sv241.CommError):
+            sv241.PosixSerial(self.dev, baudrate=123457)
+
     def test_hub_over_termios(self):
         orig = sv241.have_pyserial
         sv241.have_pyserial = lambda: False
@@ -295,6 +299,16 @@ class PortPickTests(unittest.TestCase):
     def test_non_tty_is_comm_error(self):
         with self.assertRaises(sv241.CommError):
             sv241.PosixSerial("/dev/null")
+
+    def test_ports_listing_tolerates_missing_pid(self):
+        orig = sv241.list_serial_ports
+        sv241.list_serial_ports = lambda: [("/dev/ttyUSB0", 0x1A86, None, "odd")]
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(sv241.cmd_ports(None), 0)
+            self.assertIn("????:????", out.getvalue())
+        finally:
+            sv241.list_serial_ports = orig
 
     def test_nothing(self):
         with self.assertRaises(sv241.CommError):

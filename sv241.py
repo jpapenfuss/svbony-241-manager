@@ -297,7 +297,9 @@ class PosixSerial:
             cflag &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | termios.HUPCL
                        | getattr(termios, "CRTSCTS", 0))
             cflag |= termios.CS8 | termios.CLOCAL | termios.CREAD
-            speed = getattr(termios, f"B{baudrate}")
+            speed = getattr(termios, f"B{baudrate}", None)
+            if speed is None:
+                raise CommError(f"baud rate {baudrate} not supported by termios on this OS")
             cc = list(cc)
             cc[termios.VMIN], cc[termios.VTIME] = 0, 0
             termios.tcsetattr(self.fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, speed, speed, cc])
@@ -690,7 +692,7 @@ def cmd_ports(_a):
     ports = list_serial_ports()
     for dev, vid, pid, desc in ports:
         tag = "  <- CH340 (SV241 Pro?)" if (vid, pid) == CH340 else ""
-        ids = f"{vid:04X}:{pid:04X}" if vid is not None else "????:????"
+        ids = f"{vid:04X}:{pid:04X}" if vid is not None and pid is not None else "????:????"
         print(f"{dev:<28} {ids}  {desc}{tag}")
     if not ports:
         print("no serial ports found")
