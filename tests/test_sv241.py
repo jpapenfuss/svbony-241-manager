@@ -128,7 +128,7 @@ class TuiTests(unittest.TestCase):
         select(t, "ch", "pwm1")
         t.handle("h")
         sim.cutoff, sim.saved_pwm1, sim.ch[8], sim.lens_t = True, 253, 0, 30.0
-        t.last["lens_c"], t.last["pwm1_cutoff_c"] = 30.0, 12.0   # poll hasn't noticed yet
+        self.assertFalse(t.holder.in_cutoff)                    # poll hasn't noticed yet
         for k in ["e", *"70", "enter"]:
             t.handle(k)
         self.assertIn("REFUSED", t.msg)
@@ -185,6 +185,17 @@ class TuiTests(unittest.TestCase):
             self.assertLessEqual(len(ls), h)
             for ln in ls:
                 self.assertLessEqual(sv241.visible_len(ln), w, ln)
+
+    def test_scan_error_not_double_wrapped(self):
+        t, sim = new_tui()
+        t.hub.open()
+        type(sim).in_waiting = property(lambda s: (_ for _ in ()).throw(OSError("gone")))
+        try:
+            with self.assertRaises(sv241.CommError) as cm:
+                t.hub.state()
+            self.assertEqual(str(cm.exception).count("serial I/O failed"), 1)
+        finally:
+            type(sim).in_waiting = 0
 
     def test_comm_error_is_reported_not_fatal(self):
         t, sim = new_tui()
