@@ -249,7 +249,8 @@ class CliTests(unittest.TestCase):
 
     def test_raw_bad_bytes_exit_2_without_opening(self):
         from contextlib import redirect_stderr
-        for args in (["zz"], ["08", "1ff"], ["01", "08", "10", "00"]):
+        for args in (["zz"], ["08", "1ff"], ["01", "08", "10", "00"], ["1_0"], ["+8"], [" 8"],
+                     ["-1"], ["0x"], [""]):
             FakeHub.sim = None
             with redirect_stderr(io.StringIO()) as e:
                 self.assertEqual(sv241.main(["raw", *args], hub_factory=FakeHub), 2, args)

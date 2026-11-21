@@ -833,21 +833,21 @@ def cmd_set(hub, a):
     return 0
 
 
+RAW_BYTE_RE = re.compile(r"(0[xX])?[0-9a-fA-F]{1,2}")   # one byte: 0..ff, optional 0x
+
+
 def parse_raw_bytes(tokens):
-    """`raw` arguments -> list of ints. Each token is one hex byte (00..ff, optional 0x prefix);
-    at most 3 (cmd, idx, val). Raises ValueError otherwise, so main() rejects bad input with
+    """`raw` arguments -> list of ints. Each token must be 1-2 hex digits with an optional 0x/0X
+    prefix (strict: no sign, whitespace or "_", which int(t, 16) would accept); at most 3
+    (cmd, idx, val). Raises ValueError otherwise, so main() rejects bad input with
     exit 2 before the port is opened (frame() would otherwise silently mask values > 0xFF)."""
     if len(tokens) > 3:
         raise ValueError(f"raw takes at most 3 bytes (cmd idx val), got {len(tokens)}")
     vals = []
     for t in tokens:
-        try:
-            v = int(t, 16)
-        except ValueError:
-            raise ValueError(f"raw: '{t}' is not a hex byte") from None
-        if not 0 <= v <= 0xFF:
-            raise ValueError(f"raw: '{t}' is outside 00..ff")
-        vals.append(v)
+        if not RAW_BYTE_RE.fullmatch(t):
+            raise ValueError(f"raw: '{t}' is not a hex byte 00..ff")
+        vals.append(int(t, 16))
     return vals
 
 
