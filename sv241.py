@@ -190,8 +190,9 @@ def dew_point(t, rh):
     """Dew point (°C) from temperature t (°C) and relative humidity rh (%), or None.
 
     Magnus with a = 17.27, b = 237.7, taken from earlier client code (docs/PROTOCOL.md tags them
-    [C], not read out of the firmware); the cutoff predictions made with them matched the hub. RH is clamped to 100; RH <= 0 returns None (the firmware then uses -100 °C,
-    which can never trip the cutoff)."""
+    [C], not read out of the firmware); the cutoff predictions made with them matched the hub.
+    RH is clamped to 100; RH <= 0 returns None (the firmware then uses -100 °C, which can never
+    trip the cutoff)."""
     if t is None or rh is None or rh <= 0:
         return None
     a, b = 17.27, 237.7
@@ -512,7 +513,7 @@ class Hub:
         s.bytesize, s.parity, s.stopbits = 8, "N", 1
         s.xonxoff = s.rtscts = s.dsrdtr = False
         # Must be set before open(): pyserial applies them as part of opening. Asserting DTR/RTS
-        # drives the ESP32 EN/IO0 auto-reset circuit and reboots the hub (docs/PROTOCOL.md).
+        # drives the ESP32 auto-reset circuit and reboots the hub (docs/PROTOCOL.md).
         s.dtr = s.rts = False
         try:
             s.open()
@@ -630,8 +631,9 @@ class Hub:
     # --- writes --------------------------------------------------------------------------
     def set_raw(self, idx, val):
         """Send CMD 01 (idx 0-6 output with val 00/FF, 7-9 level with raw val); return the ack:
-        'ok' (24 06 01 idx FF chk), 'refused' (24 06 01 idx 00 chk, i.e. status byte 00: e.g. PWM1 during the dew cutoff, or an
-        output value other than 00/FF) or 'noack' (missing or malformed reply). The ack alone is
+        'ok' (24 06 01 idx FF chk), 'refused' (24 06 01 idx 00 chk, status byte 00: e.g. PWM1
+        during the dew cutoff, or an output value other than 00/FF) or 'noack' (missing or
+        malformed reply). The ack alone is
         not trusted as proof; callers that care read the state back."""
         ack = self.xfer(frame(0x01, idx, val), 6)
         if (len(ack) == 6 and ack[0] == 0x24 and ack[1] == 0x06 and ack[2] == 0x01
