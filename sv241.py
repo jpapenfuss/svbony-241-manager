@@ -90,7 +90,9 @@ Protocol (firmware V1.3, disassembly-verified)
 Known unknowns: which of temp A/B is the lens probe (assumed 04 = lens, 05 = ambient), and the
 exact ADJ OUT volts-per-raw (vendor app's 15.3 V at raw 253 is used). Use raw:N when it matters.
 
-Requires Python 3.8+ and pyserial (pip install pyserial). Not affiliated with SVBONY.
+Requires Python 3.8+. Windows needs pyserial (pip install pyserial); on macOS and Linux it is
+optional: without it a built-in termios backend is used and ports are found via /dev + sysfs.
+Not affiliated with SVBONY.
 """
 import argparse
 import collections
@@ -164,6 +166,209 @@ def cutoff_limit(ambient, rh):
 
 
 # ------------------------------------------------------------------------------------------
+# Port discovery and a stdlib serial backend for macOS / Linux
+# ------------------------------------------------------------------------------------------
+def have_pyserial():
+    try:
+        import serial  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _linux_usb_ids(dev):
+    """(vid, pid, description) of a Linux tty from sysfs, or (None, None, '')."""
+    import glob
+    base = f"/sys/class/tty/{os.path.basename(dev)}/device"
+    try:
+        p = os.path.realpath(base)
+    except OSError:
+        return None, None, ""
+    for _ in range(6):                      # walk up from the interface to the USB device node
+        try:
+            with open(os.path.join(p, "idVendor")) as f:
+                vid = int(f.read(), 16)
+            with open(os.path.join(p, "idProduct")) as f:
+                pid = int(f.read(), 16)
+            prod = ""
+            for name in ("product", "manufacturer"):
+                for fn in glob.glob(os.path.join(p, name)):
+                    with open(fn) as f:
+                        prod = prod or f.read().strip()
+            return vid, pid, prod
+        except (OSError, ValueError):
+            p = os.path.dirname(p)
+    return None, None, ""
+
+
+def posix_ports():
+    """[(device, vid, pid, description)] for USB serial ports, without pyserial.
+    Linux: /dev/ttyUSB*, /dev/ttyACM* with VID:PID from sysfs. macOS: /dev/cu.* USB serial nodes
+    (Apple's CH34x driver: cu.usbserial-*, WCH's driver: cu.wchusbserial*); VID:PID is not
+    available without pyserial/ioreg, so names that only the WCH/CH34x drivers use count as CH340."""
+    import glob
+    out = []
+    if sys.platform.startswith("linux"):
+        for dev in sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")):
+            vid, pid, desc = _linux_usb_ids(dev)
+            out.append((dev, vid, pid, desc or "USB serial"))
+    elif sys.platform == "darwin":
+        for dev in sorted(glob.glob("/dev/cu.*")):
+            n = os.path.basename(dev)[3:].lower()
+            if "wchusbserial" in n:
+                out.append((dev, *CH340, "WCH CH34x driver"))
+            elif n.startswith(("usbserial", "usbmodem")):
+                out.append((dev, None, None, "USB serial"))
+    return out
+
+
+def list_serial_ports():
+    """[(device, vid, pid, description)], via pyserial when installed, else posix_ports()."""
+    if have_pyserial():
+        from serial.tools import list_ports
+        return [(p.device, p.vid, p.pid, p.description) for p in list_ports.comports()]
+    if os.name == "nt":
+        raise CommError("pyserial is required on Windows: pip install pyserial")
+    return posix_ports()
+
+
+def pick_port(ports):
+    """CH340 matches first; on macOS, cu.* (non-blocking open) over tty.*; else a lone USB serial
+    port as a guess. Returns (device, note or None)."""
+    def pref(dev):
+        return (0 if "/cu." in dev else 1, dev)
+    hits = sorted((d for d, v, p, _ in ports if (v, p) == CH340), key=pref)
+    if sys.platform == "darwin":
+        hits = [d for d in hits if "/tty." not in d] or hits
+    if hits:
+        return hits[0], (f"several CH340 ports {hits}, using {hits[0]}" if len(hits) > 1 else None)
+    usb = [d for d, v, p, desc in ports if v is None and "/tty." not in d]
+    if len(usb) == 1:
+        return usb[0], f"no port identified as CH340; trying the only USB serial port {usb[0]}"
+    raise CommError("no CH340 (1A86:7523) port found; pass --port"
+                    + (f" (USB serial ports seen: {', '.join(usb)})" if usb else ""))
+
+
+class PosixSerial:
+    """Minimal termios serial port with the pyserial surface Hub uses: read(n) with a timeout,
+    write, flush, reset_input_buffer, in_waiting, close. 8N1, no flow control, raw mode.
+    DTR/RTS: the kernel raises both on open (pyserial on POSIX does the same before it can lower
+    them); they are dropped immediately after, and HUPCL is cleared so close() doesn't pulse them.
+    Raising both together does not trigger the ESP32 auto-reset circuit, which needs one without
+    the other."""
+
+    def __init__(self, port, baudrate=BAUD, timeout=0.05):
+        import fcntl
+        import termios
+        self.port, self.timeout = port, timeout
+        try:
+            self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except PermissionError as e:
+            hint = (" (add yourself to the 'dialout' group, or 'uucp' on Arch, then log in again)"
+                    if sys.platform.startswith("linux") else "")
+            raise CommError(f"can't open {port}: {e}{hint}")
+        except OSError as e:
+            raise CommError(f"can't open {port}: {e}")
+        try:
+            try:
+                fcntl.ioctl(self.fd, termios.TIOCEXCL)     # refuse other openers (non-root)
+            except OSError:
+                pass
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise CommError(f"{port} is in use by another program")
+            except OSError:
+                pass                                       # device doesn't support flock
+            self._lines(False)
+            attr = termios.tcgetattr(self.fd)
+            iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attr
+            iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR
+                       | termios.IGNCR | termios.ICRNL | termios.IXON | termios.IXOFF | termios.IXANY)
+            oflag &= ~termios.OPOST
+            lflag &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+            cflag &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | termios.HUPCL
+                       | getattr(termios, "CRTSCTS", 0))
+            cflag |= termios.CS8 | termios.CLOCAL | termios.CREAD
+            speed = getattr(termios, f"B{baudrate}")
+            cc = list(cc)
+            cc[termios.VMIN], cc[termios.VTIME] = 0, 0
+            termios.tcsetattr(self.fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, speed, speed, cc])
+            self._lines(False)
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+        except Exception:
+            os.close(self.fd)
+            raise
+
+    def _lines(self, on):
+        import fcntl
+        import struct
+        import termios
+        bits = getattr(termios, "TIOCM_DTR", 0x002) | getattr(termios, "TIOCM_RTS", 0x004)
+        req = getattr(termios, "TIOCMBIS" if on else "TIOCMBIC", None)
+        if req is None:
+            return
+        try:
+            fcntl.ioctl(self.fd, req, struct.pack("I", bits))
+        except OSError:
+            pass                                          # ptys and some adapters lack modem lines
+
+    @property
+    def in_waiting(self):
+        import fcntl
+        import struct
+        import termios
+        try:
+            return struct.unpack("I", fcntl.ioctl(self.fd, termios.FIONREAD, b"\0\0\0\0"))[0]
+        except OSError:
+            return 0
+
+    def read(self, n):
+        import select
+        buf = bytearray()
+        end = time.monotonic() + self.timeout
+        while len(buf) < n:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            r, _, _ = select.select([self.fd], [], [], left)
+            if not r:
+                break
+            chunk = os.read(self.fd, n - len(buf))
+            if not chunk:
+                raise OSError(f"{self.port} disconnected")
+            buf += chunk
+        return bytes(buf)
+
+    def write(self, data):
+        import select
+        data = memoryview(bytes(data))
+        while data:
+            select.select([], [self.fd], [], 1.0)
+            k = os.write(self.fd, data)
+            data = data[k:]
+        return len(data)
+
+    def flush(self):
+        import termios
+        try:
+            termios.tcdrain(self.fd)
+        except OSError:
+            pass
+
+    def reset_input_buffer(self):
+        import termios
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            finally:
+                self.fd = None
+
+
+# ------------------------------------------------------------------------------------------
 # Serial link
 # ------------------------------------------------------------------------------------------
 class Hub:
@@ -177,19 +382,23 @@ class Hub:
 
     @staticmethod
     def find_port():
-        from serial.tools import list_ports
-        hits = [p.device for p in list_ports.comports() if (p.vid, p.pid) == CH340]
-        if not hits:
-            raise CommError("no CH340 (1A86:7523) port found; pass --port")
-        if len(hits) > 1:
-            print(f"note: several CH340 ports {hits}, using {hits[0]}", file=sys.stderr)
-        return hits[0]
+        dev, note = pick_port(list_serial_ports())
+        if note:
+            print(f"note: {note}", file=sys.stderr)
+        return dev
 
     def open(self):
         if self.ser:
             return self
-        import serial
         self.port = self.port_arg or self.find_port()
+        if not have_pyserial():
+            if os.name == "nt":
+                raise CommError("pyserial is required on Windows: pip install pyserial")
+            self.ser = PosixSerial(self.port, BAUD, 0.05)   # stdlib termios backend
+            time.sleep(0.3)
+            self._scan_unsolicited()
+            return self
+        import serial
         s = serial.Serial()
         s.port, s.baudrate, s.timeout = self.port, BAUD, 0.05
         s.bytesize, s.parity, s.stopbits = 8, "N", 1
@@ -444,10 +653,17 @@ def cmd_raw(hub, a):
 
 
 def cmd_ports(_a):
-    from serial.tools import list_ports
-    for p in list_ports.comports():
-        tag = "  <- CH340 (SV241 Pro?)" if (p.vid, p.pid) == CH340 else ""
-        print(f"{p.device:<14} {p.description}{tag}")
+    ports = list_serial_ports()
+    for dev, vid, pid, desc in ports:
+        tag = "  <- CH340 (SV241 Pro?)" if (vid, pid) == CH340 else ""
+        ids = f"{vid:04X}:{pid:04X}" if vid is not None else "????:????"
+        print(f"{dev:<28} {ids}  {desc}{tag}")
+    if not ports:
+        print("no serial ports found")
+    try:
+        print(f"auto-detect picks: {pick_port(ports)[0]}")
+    except CommError as e:
+        print(f"auto-detect: {e}")
     return 0
 
 
@@ -1113,7 +1329,8 @@ def cmd_tui(hub, a):
 def build_parser():
     ap = argparse.ArgumentParser(prog="sv241", description="Control and monitor an SVBONY SV241 Pro. "
                                  "With no command, runs 'hold'.")
-    ap.add_argument("--port", help="COMx or /dev/ttyUSBx (default: first CH340 found)")
+    ap.add_argument("--port", help="COMx, /dev/ttyUSBx (Linux) or /dev/cu.usbserial-x / "
+                    "/dev/cu.wchusbserialx (macOS); default: first CH340 found")
     ap.add_argument("--timeout", type=float, default=0.4, help="reply timeout in s (default 0.4)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("status", help="outputs, PWM/ADJ levels and sensors")
@@ -1180,7 +1397,11 @@ def main(argv=None, hub_factory=None):
     a = build_parser().parse_args(insert_default_command(argv))
     try:
         if a.cmd == "ports":
-            return cmd_ports(a)
+            try:
+                return cmd_ports(a)
+            except CommError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 1
         if a.cmd == "set":
             parse_level(a.channel, a.level)          # validate before touching the port
         if a.cmd in ("on", "off") and [t.lower() for t in a.outputs] != ["all"]:
@@ -1207,10 +1428,8 @@ def main(argv=None, hub_factory=None):
 
 
 if __name__ == "__main__":
-    try:
-        import serial  # noqa: F401
-    except ImportError:
-        sys.exit("pyserial missing: pip install pyserial")
+    if os.name == "nt" and not have_pyserial():
+        sys.exit("pyserial missing: pip install pyserial (macOS/Linux work without it)")
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8")   # "°" prints as garbage in Git Bash otherwise
