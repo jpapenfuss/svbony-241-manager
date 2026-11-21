@@ -88,7 +88,8 @@ class FakeSerial:
         pass
 
     def lens(self):
-        """First-order lag toward ambient + 1 + gain * PWM1 duty (advances once per request)."""
+        """First-order lag toward ambient + 1 + gain * PWM1 duty. Advances one step per call;
+        every valid request calls it once (update_cutoff), sensor requests (03-07) once more."""
         target = self.ambient + 1.0 + self.lens_gain * self.ch[8] / 255.0
         self.lens_t += 0.05 * (target - self.lens_t)
         return self.lens_t + self.rng.uniform(-self.noise, self.noise)

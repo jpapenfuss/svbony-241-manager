@@ -1,5 +1,5 @@
 """
-svbony-probe.py: one-off hardware probe proving the SV241 Pro checksum rule (Windows, COM6).
+svbony-probe.py: one-off hardware probe testing the SV241 Pro checksum rule (Windows, COM6).
 
 Question it answers: when a request frame's bytes sum to exactly 255, which checksum does the
 firmware accept? The vendor app sends 0xFF there; the firmware compares against the true

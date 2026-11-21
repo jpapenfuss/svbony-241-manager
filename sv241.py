@@ -189,8 +189,8 @@ def base255(bs):
 def dew_point(t, rh):
     """Dew point (°C) from temperature t (°C) and relative humidity rh (%), or None.
 
-    Magnus with the firmware's own constants (a = 17.27, b = 237.7), so the cutoff prediction
-    matches the hub. RH is clamped to 100; RH <= 0 returns None (the firmware then uses -100 °C,
+    Magnus with a = 17.27, b = 237.7, taken from earlier client code (docs/PROTOCOL.md tags them
+    [C], not read out of the firmware); the cutoff predictions made with them matched the hub. RH is clamped to 100; RH <= 0 returns None (the firmware then uses -100 °C,
     which can never trip the cutoff)."""
     if t is None or rh is None or rh <= 0:
         return None
@@ -314,7 +314,8 @@ class PosixSerial:
     DTR/RTS: the kernel raises both on open (pyserial on POSIX does the same before it can lower
     them); they are dropped immediately after, and HUPCL is cleared so close() doesn't pulse them.
     Raising both together does not trigger the ESP32 auto-reset circuit, which needs one without
-    the other."""
+    the other. (That relies on the standard ESP32 two-transistor auto-reset wiring; it is not yet
+    confirmed on this hub, so treat a "hub REBOOTED" event on POSIX open as a sign it is wrong.)"""
 
     def __init__(self, port, baudrate=BAUD, timeout=0.05):
         """Open and configure `port`; raises CommError (busy, permission, not a tty).
@@ -510,8 +511,8 @@ class Hub:
         s.port, s.baudrate, s.timeout = self.port, BAUD, 0.05
         s.bytesize, s.parity, s.stopbits = 8, "N", 1
         s.xonxoff = s.rtscts = s.dsrdtr = False
-        # Must be set before open(): pyserial applies them as part of opening. Asserting one of
-        # DTR/RTS without the other drives the ESP32 EN/IO0 auto-reset circuit and reboots the hub.
+        # Must be set before open(): pyserial applies them as part of opening. Asserting DTR/RTS
+        # drives the ESP32 EN/IO0 auto-reset circuit and reboots the hub (docs/PROTOCOL.md).
         s.dtr = s.rts = False
         try:
             s.open()
@@ -603,6 +604,8 @@ class Hub:
     def sensors(self):
         """Read all sensors and derive the rest. Returns a dict (None where unavailable):
         input_v, current_a, power_w, lens_c, ambient_c, humidity_pct, dewpoint_c, pwm1_cutoff_c.
+        Exception: with no INA219 fitted the firmware sends -1 for 03/07, which decodes as +1.56
+        here; that case is not detected, so input_v ~ 1.56 V means "no power sensor", not None.
 
         04 = lens probe (DS18B20), 05 = ambient (SHT4x): both confirmed on hardware. Current and
         power use the vendor app's correction (INA_SCALE, PWR_OFFSET_MW). The firmware samples
@@ -627,7 +630,7 @@ class Hub:
     # --- writes --------------------------------------------------------------------------
     def set_raw(self, idx, val):
         """Send CMD 01 (idx 0-6 output with val 00/FF, 7-9 level with raw val); return the ack:
-        'ok' (24 06 01 idx FF chk), 'refused' (idx 00: e.g. PWM1 during the dew cutoff, or an
+        'ok' (24 06 01 idx FF chk), 'refused' (24 06 01 idx 00 chk, i.e. status byte 00: e.g. PWM1 during the dew cutoff, or an
         output value other than 00/FF) or 'noack' (missing or malformed reply). The ack alone is
         not trusted as proof; callers that care read the state back."""
         ack = self.xfer(frame(0x01, idx, val), 6)
@@ -709,7 +712,8 @@ def fmt_level(name, raw):
 
 def parse_outputs(tokens):
     """Output names (space- or comma-separated; case, '-' and '_' ignored) -> sorted unique
-    indexes 0..6. "all" is handled by the caller (it maps to the firmware all-on/off command)."""
+    indexes 0..6. A lone "all" is handled by the caller (firmware all-on/off command) and never
+    reaches here; "all" mixed with other names is rejected as unknown."""
     idx = []
     for t in tokens:
         for part in t.split(","):
@@ -1118,7 +1122,7 @@ def cmd_hold(hub, a):
 # ------------------------------------------------------------------------------------------
 class Keys:
     """Non-blocking key reader. read(timeout) returns tokens: 'up', 'down', 'left', 'right',
-    'enter', 'esc', 'backspace', 'ctrl-c', or single printable characters."""
+    'enter', 'esc', 'backspace', 'tab', 'ctrl-c', or single printable characters."""
 
     WIN_SPECIAL = {"H": "up", "P": "down", "K": "left", "M": "right"}
     ANSI = {"A": "up", "B": "down", "C": "right", "D": "left"}
