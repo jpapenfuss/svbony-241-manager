@@ -97,6 +97,7 @@ Not affiliated with SVBONY.
 import argparse
 import collections
 import csv
+import errno
 import json
 import math
 import os
@@ -242,7 +243,8 @@ def pick_port(ports):
         hits = [d for d in hits if "/tty." not in d] or hits
     if hits:
         return hits[0], (f"several CH340 ports {hits}, using {hits[0]}" if len(hits) > 1 else None)
-    usb = [d for d, v, p, desc in ports if v is None and "/tty." not in d]
+    usb = [d for d, v, p, desc in ports if v is None and "/tty." not in d
+           and os.path.basename(d).startswith(("ttyUSB", "ttyACM", "cu.usbserial", "cu.usbmodem"))]
     if len(usb) == 1:
         return usb[0], f"no port identified as CH340; trying the only USB serial port {usb[0]}"
     raise CommError("no CH340 (1A86:7523) port found; pass --port"
@@ -263,12 +265,14 @@ class PosixSerial:
         self.port, self.timeout = port, timeout
         try:
             self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        except PermissionError as e:
+        except OSError as e:
+            if e.errno == errno.EBUSY:
+                raise CommError(f"{port} is in use by another program")
+            if not isinstance(e, PermissionError):
+                raise CommError(f"can't open {port}: {e}")
             hint = (" (add yourself to the 'dialout' group, or 'uucp' on Arch, then log in again)"
                     if sys.platform.startswith("linux") else "")
             raise CommError(f"can't open {port}: {e}{hint}")
-        except OSError as e:
-            raise CommError(f"can't open {port}: {e}")
         try:
             try:
                 fcntl.ioctl(self.fd, termios.TIOCEXCL)     # refuse other openers (non-root)
@@ -280,6 +284,8 @@ class PosixSerial:
                 raise CommError(f"{port} is in use by another program")
             except OSError:
                 pass                                       # device doesn't support flock
+            # (flock only stops other flock users, e.g. a second copy of this script; TIOCEXCL
+            # above is what makes other programs' opens fail with EBUSY.)
             self._lines(False)
             attr = termios.tcgetattr(self.fd)
             iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attr
@@ -296,6 +302,9 @@ class PosixSerial:
             termios.tcsetattr(self.fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, speed, speed, cc])
             self._lines(False)
             termios.tcflush(self.fd, termios.TCIOFLUSH)
+        except termios.error as e:
+            os.close(self.fd)
+            raise CommError(f"can't configure {port}: {e} (not a serial port?)")
         except Exception:
             os.close(self.fd)
             raise
@@ -334,7 +343,10 @@ class PosixSerial:
             r, _, _ = select.select([self.fd], [], [], left)
             if not r:
                 break
-            chunk = os.read(self.fd, n - len(buf))
+            try:
+                chunk = os.read(self.fd, n - len(buf))
+            except BlockingIOError:
+                continue
             if not chunk:
                 raise OSError(f"{self.port} disconnected")
             buf += chunk
@@ -343,11 +355,17 @@ class PosixSerial:
     def write(self, data):
         import select
         data = memoryview(bytes(data))
+        total, end = len(data), time.monotonic() + 2.0
         while data:
-            select.select([], [self.fd], [], 1.0)
-            k = os.write(self.fd, data)
+            if time.monotonic() > end:
+                raise OSError(f"write to {self.port} timed out")
+            select.select([], [self.fd], [], 0.5)
+            try:
+                k = os.write(self.fd, data)
+            except BlockingIOError:
+                continue
             data = data[k:]
-        return len(data)
+        return total
 
     def flush(self):
         import termios
@@ -383,6 +401,7 @@ class Hub:
     @staticmethod
     def find_port():
         dev, note = pick_port(list_serial_ports())
+        Hub._guessed = note is not None and "trying" in note
         if note:
             print(f"note: {note}", file=sys.stderr)
         return dev
@@ -397,7 +416,7 @@ class Hub:
             self.ser = PosixSerial(self.port, BAUD, 0.05)   # stdlib termios backend
             time.sleep(0.3)
             self._scan_unsolicited()
-            return self
+            return self._verify_guess()
         import serial
         s = serial.Serial()
         s.port, s.baudrate, s.timeout = self.port, BAUD, 0.05
@@ -411,6 +430,19 @@ class Hub:
         self.ser = s
         time.sleep(0.3)
         self._scan_unsolicited()
+        return self._verify_guess()
+
+    def _verify_guess(self):
+        """A port picked by name only (no VID:PID match) must answer a read-only state query
+        before anything is written to it."""
+        if not getattr(Hub, "_guessed", False) or self.port_arg:
+            return self
+        try:
+            self.state(tries=2)
+        except CommError:
+            self.close()
+            raise CommError(f"{self.port} (guessed) did not answer like an SV241 Pro; pass --port")
+        Hub._guessed = False
         return self
 
     def close(self):

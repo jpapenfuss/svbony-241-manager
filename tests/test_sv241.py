@@ -237,6 +237,18 @@ class PortPickTests(unittest.TestCase):
         self.assertEqual(dev, "/dev/cu.usbserial-1410")
         self.assertIn("trying", note)
 
+    def test_non_usb_ports_are_never_guessed(self):
+        for ports in ([("COM1", None, None, "Communications Port")],
+                      [("/dev/cu.Bluetooth-Incoming-Port", None, None, "")],
+                      [("/dev/ttyS0", None, None, "")]):
+            with self.assertRaises(sv241.CommError):
+                sv241.pick_port(ports)
+
+    @unittest.skipIf(os.name == "nt", "POSIX termios backend")
+    def test_non_tty_is_comm_error(self):
+        with self.assertRaises(sv241.CommError):
+            sv241.PosixSerial("/dev/null")
+
     def test_nothing(self):
         with self.assertRaises(sv241.CommError):
             sv241.pick_port([("/dev/ttyUSB0", 0x0403, 0x6001, "FTDI")])
