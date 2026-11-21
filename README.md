@@ -40,7 +40,8 @@ python sv241.py ports
 ```
 
 Exit codes: `0` ok, `1` comm error, `2` refused by hub (e.g. PWM1 during dew cutoff) or bad
-argument. Settings persist on the hub (firmware auto-saves to flash every 5 s).
+argument (exception: a non-hex `raw` byte currently ends in a traceback, exit 1). Settings
+persist on the hub (firmware auto-saves to flash every 5 s).
 
 ### macOS / Linux
 
@@ -154,8 +155,16 @@ Open:
 
 | File | Purpose |
 | --- | --- |
-| `sv241.py` | Controller: one-shot commands + hold mode |
+| `sv241.py` | Controller: one-shot commands, hold mode, TUI; layout map in its module docstring |
 | `svbony-probe.py` | Checksum experiment (0xFF vs 0x00 for sum = 255) on a PWM1 write; hard-coded COM6 |
 | `docs/PROTOCOL.md` | Wire protocol, encoding, firmware behaviour |
 | `tests/fake_hub.py` | Software SV241 Pro (frames, checksum, sensors, PWM1 cutoff); `python tests/fake_hub.py tui` runs any sv241.py command against it |
 | `tests/test_sv241.py` | Simulator tests incl. termios backend over a pty: `python -m unittest discover -s tests` (no pyserial needed) |
+
+## Contributing
+
+The Python files carry detailed comment blocks: a module header (purpose, usage, protocol
+summary pointing at `docs/PROTOCOL.md`), docstrings on classes and functions, and inline notes on
+non-obvious protocol details (checksum, base-255 decode, PWM1 cutoff, DTR/RTS, untested output
+switching). Keep them accurate in every change: update a comment whenever the code it describes
+changes, and update `docs/PROTOCOL.md` when protocol knowledge changes.

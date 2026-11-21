@@ -45,7 +45,8 @@ Ctrl+C exits and leaves settings as they are.
 Global options go before the command: --port COM6, --timeout 0.4.
 
 One-shot exit codes: 0 success, 1 comm error, 2 hub did not take the value (e.g. PWM1 refused
-by the firmware dew cutoff) or bad argument. Settings persist on the hub (it saves them to flash).
+by the firmware dew cutoff) or bad argument (exception: a non-hex `raw` byte currently ends in a
+ValueError traceback, exit 1). Settings persist on the hub (it saves them to flash).
 
 Only one program can hold the serial port: close NINA's connection to the hub, the vendor app,
 or another running copy of this script first.
@@ -72,23 +73,44 @@ firmware samples sensors every 5 s, and each INA219 reading is a sub-millisecond
 the dew heaters switch at 10 Hz, so a reading catches each heater fully on or fully off. "Max"
 approximates every heater on at once; "Avg" (and Wh) is the better guide to consumption.
 
-Protocol (firmware V1.3, disassembly-verified)
-----------------------------------------------
-  Frame:  24 06 cmd idx val chk        chk = sum(bytes) % 255   (never 0xFF)
-  Reply:  24 len cmd payload... chk    len = payload + 4
+Protocol (firmware V1.3, disassembly-verified; full reference in docs/PROTOCOL.md)
+----------------------------------------------------------------------------------
+  Frame:  24 06 cmd idx val chk        chk = sum(bytes) % 255   (0..254, never 0xFF)
+  Reply:  24 len cmd payload... chk    len = payload + 4 (6, 8 or 14)
   01 idx val   set: idx 0-6 outputs (val 00/FF), 7 ADJ, 8 PWM1, 9 PWM2 (val raw);
                ack 24 06 01 idx FF|00 chk (00 = refused)
-  03 / 04 / 05 / 06 / 07   input V / temp A / temp B / RH / current
+  03 / 04 / 05 / 06 / 07   input V / lens probe / ambient / RH / current
   08           state: 7 output bytes, ADJ, PWM1, PWM2
   FE FE / FF FF            all outputs on / off
+  Exchange is half-duplex: flush input, send one 6-byte frame, read one fixed-length reply.
+  Bad frames (wrong checksum) are dropped silently; there is no NAK, only a missing reply.
   Sensor payload b3..b6 is base-255, not base-256: x = ((b3*255 + b4)*255 + b5)*255 + b6,
-  value = x / 100; temperatures and RH carry a +255 offset. (The old big-endian decode read
-  about 0.6 °C and 2.2 %RH high.)
+  value = x / 100; temperatures and RH carry a +255 offset. (The old script's big-endian decode
+  reads high by b5/100; with its empirical -255.5 / -254 offsets that came to about +0.6 °C and
+  +2.2 %RH.) The firmware's upper two bytes are not true base-255 digits,
+  but they are 0 for every value this script reads (x < 65025), so the decode is exact here.
   DTR/RTS must be low before the port opens, or the ESP32 resets. The hub sends nothing
   unprompted except its "SV241Pro ..." boot banner, so seeing that means it rebooted.
 
-Known unknowns: which of temp A/B is the lens probe (assumed 04 = lens, 05 = ambient), and the
-exact ADJ OUT volts-per-raw (vendor app's 15.3 V at raw 253 is used). Use raw:N when it matters.
+Hardware status (2026-11-21, COM6): reads, PWM2 write/read-back, hold mode, base-255 decode,
+04 = lens / 05 = ambient and the PWM1 cutoff formula are confirmed. DC/USB output switching
+(on/off, all on/off) follows the firmware disassembly but is NOT yet tested on hardware.
+
+Known unknowns: the exact ADJ OUT volts-per-raw (vendor app's 15.3 V at raw 253 is used; the
+firmware only sets a 40 kHz PWM duty, so the real scale depends on the board's regulator), and
+the scale of cmd 02 (INA219 power, unused here). Use raw:N when the ADJ voltage matters.
+
+Code layout (sections in file order)
+------------------------------------
+  Protocol helpers     frame(), checksum_ok(), base255(), dew_point(), cutoff_limit()
+  Port discovery       list_serial_ports(), pick_port(), PosixSerial (stdlib termios backend)
+  Serial link          Hub: open/verify/close, xfer(), state()/sensors() reads, verified writes
+  Parsing/formatting   parse_level() (V / % / raw:N -> raw), fmt_level(), parse_outputs()
+  One-shot commands    cmd_status, cmd_sensors, cmd_switch, cmd_set, cmd_raw, cmd_ports
+  Hold mode            Stat, Holder (poll, enforce, cutoff tracking, CSV, render), cmd_hold
+  TUI mode             Keys (raw key reader), Tui (keyboard actions on top of Holder), cmd_tui
+  CLI                  build_parser(), insert_default_command(), main()
+tests/fake_hub.py simulates the hub for tests/test_sv241.py (python -m unittest discover -s tests).
 
 Requires Python 3.8+. Windows needs pyserial (pip install pyserial); on macOS and Linux it is
 optional: without it a built-in termios backend is used and ports are found via /dev + sysfs.
@@ -107,41 +129,59 @@ import signal
 import sys
 import time
 
-BAUD = 115200
-CH340 = (0x1A86, 0x7523)
+# --- Hardware / protocol constants ---------------------------------------------------------
+BAUD = 115200                     # CH340 line rate; 8N1, no flow control
+CH340 = (0x1A86, 0x7523)          # USB VID:PID of the hub's WCH CH340 bridge (auto-detect key)
+# Output names in hub index order: CMD 01 idx 0..6 and bytes 3..9 of the CMD 08 state reply.
+# idx 0 = DC1 follows the firmware GPIO table; not yet confirmed by a physical bench check.
 OUTPUTS = ["DC1", "DC2", "DC3", "DC4", "DC5", "USB-C", "USB-A"]
-OUT_ALIASES = {n.lower().replace("-", ""): i for i, n in enumerate(OUTPUTS)}
+OUT_ALIASES = {n.lower().replace("-", ""): i for i, n in enumerate(OUTPUTS)}   # dc1, usbc, ...
 OUT_ALIASES.update({str(i + 1): i for i in range(5)})          # "1".."5" -> DC1..DC5
 CHANNELS = {"adj": 7, "pwm1": 8, "pwm2": 9}                    # hub index for CMD 01
+# Levels are raw 0..255 (firmware LEDC duty = round(raw/255 * 1023)). The vendor app calls 253
+# "100 %" and "15.3 V"; those are app conventions, kept so values match what users see there.
 RAW_FULL = 253           # vendor app's 100 % / 15.3 V point
-RAW_MAX = 255
-ADJ_VMAX = 15.3
-INA_SCALE = 15.57        # vendor app's INA219 current correction
-PWR_OFFSET_MW = 269.39   # vendor app's fixed power offset
+RAW_MAX = 255            # firmware accepts the full byte range
+ADJ_VMAX = 15.3          # assumed ADJ OUT volts at RAW_FULL (linear scale; unverified on hardware)
+INA_SCALE = 15.57        # vendor app's INA219 current correction (implies a non-default board shunt)
+PWR_OFFSET_MW = 269.39   # vendor app's fixed power offset (mW)
 COMMANDS = ("status", "sensors", "on", "off", "set", "raw", "ports", "hold", "tui")
 
 
 class CommError(Exception):
-    pass
+    """Serial-level failure: port missing/busy, I/O error, or no valid reply. Exit code 1."""
 
 
 class Refused(Exception):
-    pass
+    """The hub answered but did not take a write (read-back mismatch or refusal ack). Exit code 2."""
 
 
 # ------------------------------------------------------------------------------------------
 # Protocol helpers
 # ------------------------------------------------------------------------------------------
 def frame(cmd, idx=0, val=0):
+    """Build a 6-byte request: 24 06 cmd idx val chk.
+
+    chk = sum of the first five bytes mod 255 (0..254). The firmware compares against the true
+    remainder, so a frame summing to exactly 255 must carry 0x00; the vendor app's 0xFF there is
+    silently dropped (svbony-probe.py demonstrates this). Read commands ignore idx/val, and the
+    all-on/off commands need idx to repeat the command byte (frame(0xFE, 0xFE))."""
     b = [0x24, 0x06, cmd & 0xFF, idx & 0xFF, val & 0xFF]
     return bytes(b + [sum(b) % 255])
 
 
 def checksum_ok(r):
+    """True if reply r (any length >= 4) ends in sum(r[:-1]) % 255. Does not check 24/len/cmd."""
     return len(r) >= 4 and sum(r[:-1]) % 255 == r[-1]
 
 
 def base255(bs):
+    """Decode sensor payload bytes as base-255 digits, most significant first.
+
+    The firmware builds each byte as a quotient mod 255 of x = trunc(value * 100). For x < 65025
+    (every voltage, temperature, RH and current reading) the top two bytes are 0 and this is exact.
+    It is not exact for large cmd 02 power values, which this script does not use (see
+    docs/PROTOCOL.md, "Sensor value encoding")."""
     x = 0
     for b in bs:
         x = x * 255 + b
@@ -149,7 +189,12 @@ def base255(bs):
 
 
 def dew_point(t, rh):
-    """Magnus with the firmware's own constants, so the cutoff prediction matches the hub."""
+    """Dew point (°C) from temperature t (°C) and relative humidity rh (%), or None.
+
+    Magnus with a = 17.27, b = 237.7, taken from earlier client code (docs/PROTOCOL.md tags them
+    [C], not read out of the firmware); the cutoff predictions made with them matched the hub.
+    RH is clamped to 100; RH <= 0 returns None (the firmware then uses -100 °C, which can never
+    trip the cutoff)."""
     if t is None or rh is None or rh <= 0:
         return None
     a, b = 17.27, 237.7
@@ -158,7 +203,12 @@ def dew_point(t, rh):
 
 
 def cutoff_limit(ambient, rh):
-    """Lens temperature above which the firmware forces PWM1 to 0 (None if unknown)."""
+    """Lens temperature above which the firmware forces PWM1 to 0 (None if unknown).
+
+    Mirrors the firmware routine at 0x400d19ac (run every 5 s): dew point + 7.5 °C above 15 °C
+    ambient, + 10 °C from 0 to 15 °C, fixed 5 °C below 0 °C. Ambient is the SHT4x reading, which
+    already has the firmware's -4 °C correction applied; do not subtract it again. Confirmed on
+    hardware: the cutoff fired exactly when the lens crossed this computed limit."""
     if ambient is None:
         return None
     if ambient < 0:
@@ -171,6 +221,7 @@ def cutoff_limit(ambient, rh):
 # Port discovery and a stdlib serial backend for macOS / Linux
 # ------------------------------------------------------------------------------------------
 def have_pyserial():
+    """True if pyserial imports. Required on Windows; optional on macOS/Linux (PosixSerial)."""
     try:
         import serial  # noqa: F401
         return True
@@ -179,7 +230,10 @@ def have_pyserial():
 
 
 def _linux_usb_ids(dev):
-    """(vid, pid, description) of a Linux tty from sysfs, or (None, None, '')."""
+    """(vid, pid, description) of a Linux tty from sysfs, or (None, None, '').
+
+    /sys/class/tty/<name>/device points at the USB *interface*; idVendor/idProduct live on the
+    parent USB device node, so walk up a few levels until they appear."""
     import glob
     base = f"/sys/class/tty/{os.path.basename(dev)}/device"
     try:
@@ -207,7 +261,8 @@ def posix_ports():
     """[(device, vid, pid, description)] for USB serial ports, without pyserial.
     Linux: /dev/ttyUSB*, /dev/ttyACM* with VID:PID from sysfs. macOS: /dev/cu.* USB serial nodes
     (Apple's CH34x driver: cu.usbserial-*, WCH's driver: cu.wchusbserial*); VID:PID is not
-    available without pyserial/ioreg, so names that only the WCH/CH34x drivers use count as CH340."""
+    available without pyserial/ioreg, so only cu.wchusbserial* (a name only WCH's driver uses)
+    counts as CH340; cu.usbserial-*/cu.usbmodem* are listed as unidentified USB serial."""
     import glob
     out = []
     if sys.platform.startswith("linux"):
@@ -235,8 +290,13 @@ def list_serial_ports():
 
 
 def pick_port(ports):
-    """CH340 matches first; on macOS, cu.* (non-blocking open) over tty.*; else a lone USB serial
-    port as a guess. Returns (device, note or None)."""
+    """Choose the hub's port from list_serial_ports() output. Returns (device, note or None).
+
+    Order: CH340 VID:PID matches, preferring macOS cu.* over tty.* (tty.* open blocks waiting
+    for carrier detect). With no CH340 match, a single USB-serial-looking device is returned as
+    a guess, flagged by a note containing "trying"; Hub._verify_guess() then requires it to
+    answer a read-only state query before anything is written. Non-USB ports (COM1, ttyS*,
+    Bluetooth) are never guessed. Raises CommError if nothing fits."""
     def pref(dev):
         return (0 if "/cu." in dev else 1, dev)
     hits = sorted((d for d, v, p, _ in ports if (v, p) == CH340), key=pref)
@@ -258,9 +318,14 @@ class PosixSerial:
     DTR/RTS: the kernel raises both on open (pyserial on POSIX does the same before it can lower
     them); they are dropped immediately after, and HUPCL is cleared so close() doesn't pulse them.
     Raising both together does not trigger the ESP32 auto-reset circuit, which needs one without
-    the other."""
+    the other. (That relies on the standard ESP32 two-transistor auto-reset wiring; it is not yet
+    confirmed on this hub, so treat a "hub REBOOTED" event on POSIX open as a sign it is wrong.)"""
 
     def __init__(self, port, baudrate=BAUD, timeout=0.05):
+        """Open and configure `port`; raises CommError (busy, permission, not a tty, bad baud).
+
+        O_NONBLOCK keeps open() from waiting on carrier detect; reads still honour `timeout` via
+        select() in read(). O_NOCTTY stops the port becoming our controlling terminal."""
         import fcntl
         import termios
         self.port, self.timeout = port, timeout
@@ -287,8 +352,11 @@ class PosixSerial:
                 pass                                       # device doesn't support flock
             # (flock only stops other flock users, e.g. a second copy of this script; TIOCEXCL
             # above is what makes other programs' opens fail with EBUSY.)
-            self._lines(False)
+            self._lines(False)                             # drop DTR/RTS as early as possible
             attr = termios.tcgetattr(self.fd)
+            # Raw mode: no input translation, no software flow control, no output processing,
+            # no echo/canonical line editing/signals. CLOCAL ignores modem status lines; HUPCL
+            # cleared so close() does not toggle DTR (which could reset the ESP32).
             iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attr
             iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP | termios.INLCR
                        | termios.IGNCR | termios.ICRNL | termios.IXON | termios.IXOFF | termios.IXANY)
@@ -301,9 +369,9 @@ class PosixSerial:
             if speed is None:
                 raise CommError(f"baud rate {baudrate} not supported by termios on this OS")
             cc = list(cc)
-            cc[termios.VMIN], cc[termios.VTIME] = 0, 0
+            cc[termios.VMIN], cc[termios.VTIME] = 0, 0     # reads return at once; select() times them
             termios.tcsetattr(self.fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, speed, speed, cc])
-            self._lines(False)
+            self._lines(False)                             # again, in case tcsetattr re-raised them
             termios.tcflush(self.fd, termios.TCIOFLUSH)
         except termios.error as e:
             os.close(self.fd)
@@ -313,6 +381,7 @@ class PosixSerial:
             raise
 
     def _lines(self, on):
+        """Raise (on=True) or drop DTR and RTS together via TIOCMBIS/TIOCMBIC; best effort."""
         import fcntl
         import struct
         import termios
@@ -327,6 +396,7 @@ class PosixSerial:
 
     @property
     def in_waiting(self):
+        """Bytes buffered for reading (FIONREAD); 0 if the driver can't say."""
         import fcntl
         import struct
         import termios
@@ -336,6 +406,9 @@ class PosixSerial:
             return 0
 
     def read(self, n):
+        """Read up to n bytes, returning early with what arrived when self.timeout expires.
+        An empty os.read() after select() says readable means the device went away (USB
+        unplugged); that raises OSError, which Hub.xfer turns into CommError and a re-open."""
         import select
         buf = bytearray()
         end = time.monotonic() + self.timeout
@@ -356,6 +429,7 @@ class PosixSerial:
         return bytes(buf)
 
     def write(self, data):
+        """Write all of data (the fd is non-blocking, so loop on partial writes); 2 s overall limit."""
         import select
         data = memoryview(bytes(data))
         total, end = len(data), time.monotonic() + 2.0
@@ -371,6 +445,7 @@ class PosixSerial:
         return total
 
     def flush(self):
+        """Wait until queued output has been transmitted (tcdrain), like pyserial's flush()."""
         import termios
         try:
             termios.tcdrain(self.fd)
@@ -378,6 +453,7 @@ class PosixSerial:
             pass
 
     def reset_input_buffer(self):
+        """Discard unread input (stale replies) before a new request."""
         import termios
         termios.tcflush(self.fd, termios.TCIFLUSH)
 
@@ -393,9 +469,19 @@ class PosixSerial:
 # Serial link
 # ------------------------------------------------------------------------------------------
 class Hub:
-    """Serial link. Opens lazily, re-opens after USB drops, spots the boot banner after a reset."""
+    """Serial link to one hub. Opens lazily, re-opens after USB drops, spots the boot banner
+    after a reset.
+
+    Every exchange goes through xfer(): one request frame, one fixed-length reply. Any I/O error
+    closes the port and raises CommError; the next call re-opens it, so long-running modes
+    (hold, tui) survive USB drops. Writes (set_output/set_all/set_channel) are verified by a
+    CMD 08 read-back and raise Refused when the hub did not take the value.
+
+    `reboot_seen` latches when the "SV241Pro" boot banner shows up in unsolicited input; the
+    hold loop reports and clears it. Tests substitute this class via main(hub_factory=...)."""
 
     def __init__(self, port=None, timeout=0.4):
+        """port: device name, or None to auto-detect on first open. timeout: reply wait (s)."""
         self.port_arg, self.timeout = port, timeout
         self.port = None
         self.ser = None
@@ -403,6 +489,9 @@ class Hub:
 
     @staticmethod
     def find_port():
+        """Auto-detect via pick_port(); prints any note to stderr.
+        Sets the class attribute Hub._guessed when the port was picked by name only, so the next
+        open() verifies it (class-level because this is a staticmethod; cleared once verified)."""
         dev, note = pick_port(list_serial_ports())
         Hub._guessed = note is not None and "trying" in note
         if note:
@@ -410,6 +499,9 @@ class Hub:
         return dev
 
     def open(self):
+        """Open the port if not already open; returns self. Uses pyserial when installed, else
+        PosixSerial (not on Windows). The serial-level timeout is short (0.05 s); xfer() applies
+        the overall reply timeout. After opening: 0.3 s settle, then check for a boot banner."""
         if self.ser:
             return self
         self.port = self.port_arg or self.find_port()
@@ -425,7 +517,9 @@ class Hub:
         s.port, s.baudrate, s.timeout = self.port, BAUD, 0.05
         s.bytesize, s.parity, s.stopbits = 8, "N", 1
         s.xonxoff = s.rtscts = s.dsrdtr = False
-        s.dtr = s.rts = False          # must be low before open(): DTR/RTS reset the ESP32
+        # Must be set before open(): pyserial applies them as part of opening. Asserting DTR/RTS
+        # drives the ESP32 auto-reset circuit and reboots the hub (docs/PROTOCOL.md).
+        s.dtr = s.rts = False
         try:
             s.open()
         except serial.SerialException as e:
@@ -449,6 +543,7 @@ class Hub:
         return self
 
     def close(self):
+        """Close the port if open; never raises. Safe to call repeatedly."""
         if self.ser:
             try:
                 self.ser.close()
@@ -463,6 +558,9 @@ class Hub:
         self.close()
 
     def _scan_unsolicited(self):
+        """Consume any bytes nobody asked for. The hub only sends unprompted output at boot
+        ("SV241Pro V1.3 ..."), so finding that text means it reset; latch reboot_seen.
+        An I/O error here closes the port and raises CommError (xfer passes it through)."""
         try:
             n = getattr(self.ser, "in_waiting", 0)
             if n and b"SV241Pro" in self.ser.read(n):
@@ -472,6 +570,10 @@ class Hub:
             raise CommError(f"serial I/O failed on {self.port}: {e}")
 
     def xfer(self, tx, expect):
+        """Send frame tx, return up to `expect` reply bytes (fewer on timeout; caller validates).
+
+        Half-duplex: input is flushed first so a late reply to an earlier request can't be taken
+        for this one. Any exception closes the port and becomes CommError."""
         self.open()
         try:
             self._scan_unsolicited()   # look for a boot banner before discarding the buffer
@@ -491,6 +593,9 @@ class Hub:
 
     # --- reads ---------------------------------------------------------------------------
     def state(self, tries=3):
+        """CMD 08. Returns (outputs, levels): outputs = 7 bools in OUTPUTS order, levels =
+        {"adj", "pwm1", "pwm2": raw 0..255}. Reply is 14 bytes: 24 0E 08 o0..o6 adj pwm1 pwm2 chk
+        (outputs reported 0/1 here, although CMD 01 sets them with 00/FF). Retries, then CommError."""
         r = b""
         for _ in range(tries):
             r = self.xfer(frame(0x08), 14)
@@ -499,6 +604,9 @@ class Hub:
         raise CommError(f"bad state reply: {r.hex(' ') or 'nothing'}")
 
     def sensor(self, cmd, tries=2):
+        """Read one sensor command (03..07). Reply is 8 bytes: 24 08 cmd b3 b4 b5 b6 chk.
+        Returns the decoded value / 100, still including the +255 offset for 04/05/06, or None
+        after `tries` bad replies (a missing reading is not a comm error)."""
         for _ in range(tries):
             r = self.xfer(frame(cmd), 8)
             if len(r) == 8 and r[0] == 0x24 and r[2] == cmd and checksum_ok(r):
@@ -506,6 +614,14 @@ class Hub:
         return None
 
     def sensors(self):
+        """Read all sensors and derive the rest. Returns a dict (None where unavailable):
+        input_v, current_a, power_w, lens_c, ambient_c, humidity_pct, dewpoint_c, pwm1_cutoff_c.
+        Exception: with no INA219 fitted the firmware sends -1 for 03/07, which decodes as +1.56
+        here; that case is not detected, so input_v ~ 1.56 V means "no power sensor", not None.
+
+        04 = lens probe (DS18B20), 05 = ambient (SHT4x): both confirmed on hardware. Current and
+        power use the vendor app's correction (INA_SCALE, PWR_OFFSET_MW). The firmware samples
+        sensors every 5 s, so polling faster returns repeated values."""
         vin = self.sensor(0x03)
         ta = self.sensor(0x04)
         tb = self.sensor(0x05)
@@ -525,7 +641,11 @@ class Hub:
 
     # --- writes --------------------------------------------------------------------------
     def set_raw(self, idx, val):
-        """Send CMD 01; returns the ack status 'ok', 'refused' or 'noack'."""
+        """Send CMD 01 (idx 0-6 output with val 00/FF, 7-9 level with raw val); return the ack:
+        'ok' (24 06 01 idx FF chk), 'refused' (24 06 01 idx 00 chk, status byte 00: e.g. PWM1
+        during the dew cutoff, or an output value other than 00/FF) or 'noack' (missing or
+        malformed reply). The ack alone is
+        not trusted as proof; callers that care read the state back."""
         ack = self.xfer(frame(0x01, idx, val), 6)
         if (len(ack) == 6 and ack[0] == 0x24 and ack[1] == 0x06 and ack[2] == 0x01
                 and ack[3] == idx and checksum_ok(ack)):
@@ -533,6 +653,8 @@ class Hub:
         return "noack"
 
     def set_output(self, idx, on):
+        """Switch output idx (0..6) on/off, verified via CMD 08; raises Refused on mismatch.
+        NOT yet tested on hardware (firmware-derived). Outputs take 00/FF, never 0/1."""
         ack = self.set_raw(idx, 0xFF if on else 0x00)
         time.sleep(0.05)
         outs, _ = self.state()
@@ -540,6 +662,9 @@ class Hub:
             raise Refused(f"{OUTPUTS[idx]} still {'on' if outs[idx] else 'off'} (ack {ack})")
 
     def set_all(self, on):
+        """Firmware all-on (24 06 FE FE 00 28) / all-off (24 06 FF FF 00 2A); PWM/ADJ untouched.
+        The firmware runs this as an RTOS task, hence the longer wait; the ack is ignored and the
+        result checked by read-back. NOT yet tested on hardware."""
         self.xfer(frame(0xFE, 0xFE) if on else frame(0xFF, 0xFF), 6)
         time.sleep(0.1)
         outs, _ = self.state()
@@ -548,6 +673,8 @@ class Hub:
             raise Refused(f"still {'off' if on else 'on'}: {', '.join(bad)}")
 
     def set_channel(self, name, raw):
+        """Set adj/pwm1/pwm2 to raw 0..255, verified by read-back (the firmware's duty round trip
+        returns the same raw value). Raises Refused, naming the PWM1 dew cutoff when it is why."""
         ack = self.set_raw(CHANNELS[name], raw)
         time.sleep(0.05)
         _, dev = self.state()
@@ -560,6 +687,10 @@ class Hub:
 # Parsing / formatting
 # ------------------------------------------------------------------------------------------
 def parse_level(name, s):
+    """User level -> raw 0..255. "raw:N" (int, any base: raw:0x78) is taken as-is; otherwise a
+    number is volts for adj (optional trailing "v") or percent for pwm1/pwm2 (optional "%"),
+    scaled so 100 % / ADJ_VMAX = RAW_FULL (253). Raises ValueError for non-finite or
+    out-of-range input. ADJ volts are approximate (see ADJ_VMAX)."""
     s = str(s).strip().lower()
     if s.startswith("raw:"):
         raw = int(s[4:], 0)
@@ -577,6 +708,7 @@ def parse_level(name, s):
 
 
 def arg_level(name):
+    """argparse `type=` wrapper around parse_level() for channel `name`."""
     def f(s):
         try:
             return parse_level(name, s)
@@ -586,6 +718,7 @@ def arg_level(name):
 
 
 def fmt_level(name, raw):
+    """Raw level -> display text: "12.10 V~" (the ~ marks the approximate ADJ scale) or "40.3 %"."""
     if raw is None:
         return "—"
     if name == "adj":
@@ -594,6 +727,9 @@ def fmt_level(name, raw):
 
 
 def parse_outputs(tokens):
+    """Output names (space- or comma-separated; case, '-' and '_' ignored) -> sorted unique
+    indexes 0..6. A lone "all" is handled by the caller (firmware all-on/off command) and never
+    reaches here; "all" mixed with other names is rejected as unknown."""
     idx = []
     for t in tokens:
         for part in t.split(","):
@@ -607,17 +743,23 @@ def parse_outputs(tokens):
 
 
 def show(v, unit, spec="{:.2f}"):
+    """Format a reading with its unit, or "n/a" for None."""
     return f"{spec.format(v)} {unit}" if v is not None else "n/a"
 
 
 def rounded(d):
+    """Round every float in a sensors() dict to 3 places for JSON output (None stays None)."""
     return {k: (round(v, 3) if v is not None else None) for k, v in d.items()}
 
 
 # ------------------------------------------------------------------------------------------
 # One-shot commands
 # ------------------------------------------------------------------------------------------
+# Each cmd_* handler takes (hub, args) (cmd_ports: args only, no hub) and returns the process
+# exit code; main() maps
+# CommError -> 1 and Refused -> 2 for anything they let escape.
 def print_sensors(s):
+    """Human-readable sensors() dict, including the PWM1 cutoff margin when computable."""
     print(f"  Input voltage  {show(s['input_v'], 'V')}")
     print(f"  Current        {show(s['current_a'], 'A', '{:.3f}')}")
     print(f"  Power          {show(s['power_w'], 'W')}   (instantaneous; heaters switch at 10 Hz)")
@@ -632,6 +774,7 @@ def print_sensors(s):
 
 
 def cmd_status(hub, a):
+    """status [--json] [--no-sensors]: outputs, ADJ/PWM levels and (by default) sensors."""
     outs, dev = hub.state()
     s = None if a.no_sensors else hub.sensors()
     if a.json:
@@ -653,6 +796,7 @@ def cmd_status(hub, a):
 
 
 def cmd_sensors(hub, a):
+    """sensors [--json]: sensor readings only."""
     s = hub.sensors()
     if a.json:
         print(json.dumps(rounded(s), indent=2))
@@ -662,6 +806,8 @@ def cmd_sensors(hub, a):
 
 
 def cmd_switch(hub, a):
+    """on/off <outputs...|all>. Each output is switched and verified separately; failures are
+    reported and the rest still attempted (rc 2 if any failed). Untested on hardware."""
     on = a.cmd == "on"
     if [t.lower() for t in a.outputs] == ["all"]:
         hub.set_all(on)
@@ -679,6 +825,7 @@ def cmd_switch(hub, a):
 
 
 def cmd_set(hub, a):
+    """set adj|pwm1|pwm2 <level>: one verified write (Refused -> rc 2 via main())."""
     name = a.channel
     raw = parse_level(name, a.level)
     hub.set_channel(name, raw)
@@ -687,6 +834,8 @@ def cmd_set(hub, a):
 
 
 def cmd_raw(hub, a):
+    """raw <cmd> [idx [val]] (hex): send one frame, print whatever arrives within the timeout.
+    Debug aid: no validation of the command, and the reply is shown even if malformed."""
     vals = [int(x, 16) for x in a.bytes]
     while len(vals) < 3:
         vals.append(0)
@@ -698,6 +847,7 @@ def cmd_raw(hub, a):
 
 
 def cmd_ports(_a):
+    """ports: list serial ports (CH340s flagged) and what auto-detect would pick. No hub needed."""
     ports = list_serial_ports()
     for dev, vid, pid, desc in ports:
         tag = "  <- CH340 (SV241 Pro?)" if (vid, pid) == CH340 else ""
@@ -753,7 +903,21 @@ SENSOR_ROWS = [
 
 
 class Holder:
+    """Hold-mode engine: poll the hub, re-push targets it no longer reports, track the PWM1 dew
+    cutoff, keep running stats/energy, optionally log CSV, and render the console display.
+    The TUI reuses it unchanged for polling and for channels the user marks "held".
+
+    targets: {channel: raw} to enforce (only channels given on the command line, or all three
+    with --hold-current). status: per-channel text for the display. events: recent event lines.
+    counts: re-pushes, failures, cutoffs, reboots and comm errors.
+
+    PWM1 cutoff handling: while the firmware holds PWM1 at 0 it refuses writes, so a PWM1 that
+    reads 0 with the refusal ack (or with our own cutoff_limit() predicting it) is reported as
+    "FIRMWARE CUTOFF", not as a failed push. It is retried every poll (harmless: refused), and
+    the firmware restores the saved level itself when the lens cools below the limit."""
+
     def __init__(self, a, hub):
+        """a: parsed args (adj/pwm1/pwm2 targets, events, csv, no_clear, interval, hold_current)."""
         self.a = a
         self.hub = hub
         self.targets = {k: v for k, v in (("adj", a.adj), ("pwm1", a.pwm1), ("pwm2", a.pwm2))
@@ -778,6 +942,7 @@ class Holder:
                                    "cutoff_predicted", "event"])
 
     def event(self, msg):
+        """Record a timestamped event; with --no-clear also print it (service-friendly log)."""
         line = f"{time.strftime('%H:%M:%S')} {msg}"
         self.events.append(line)
         self._last_event = msg
@@ -785,6 +950,9 @@ class Holder:
             print(line, flush=True)
 
     def poll(self):
+        """One cycle: read state + sensors, report reboots/cutoff transitions, enforce targets
+        (write, wait 50 ms, read back), update stats/energy, write the CSV row. Returns the
+        sensors dict plus outs/dev (dev reflects successful re-pushes). CommError propagates."""
         self._last_event = ""
         outs, dev = self.hub.state()
         s = self.hub.sensors()
@@ -796,6 +964,9 @@ class Holder:
             self.counts["reboot"] += 1
             self.event("hub REBOOTED (boot banner seen); settings were reloaded from its flash")
 
+        # Cutoff entry/exit detection. Entry: PWM1 reads 0 while our formula predicts the cutoff.
+        # Exit differs: unenforced PWM1 counts as released once it is non-zero again; an enforced
+        # one once it is back at its target (the firmware restores the level saved at entry).
         if "pwm1" not in self.targets:
             # Monitor only: still report the firmware cutoff, from PWM1 reading 0 while predicted.
             if predicted and not self.in_cutoff and dev["pwm1"] == 0:
@@ -833,6 +1004,8 @@ class Holder:
                 self.event(f"{N} was {fmt_level(name, got)} (raw {got}); re-pushed "
                            f"{fmt_level(name, want)} (raw {want}), verified")
                 dev[name] = want
+            # Push did not take. For PWM1 a refusal ack or a predicted cutoff means the firmware
+            # is holding it at 0 on purpose: report once, keep retrying quietly each poll.
             elif name == "pwm1" and (res == "refused" or predicted):
                 why = (f"lens {lens:.2f} °C > limit {limit:.2f} °C" if predicted
                        else "write refused by firmware")
@@ -870,6 +1043,8 @@ class Holder:
         return dict(s, outs=outs, dev=dev)
 
     def render(self, s, err=None):
+        """Redraw the full-screen hold display (clear + home, ANSI). s is poll()'s result or None
+        after a comm error (then only the header, error, counts and events are shown)."""
         if self.a.no_clear:
             return
         up = int(time.time() - self.started)
@@ -909,6 +1084,8 @@ class Holder:
         sys.stdout.flush()
 
     def run(self, max_polls=None):
+        """Main hold loop: optionally adopt current levels as targets, then poll every
+        --interval seconds until Ctrl+C (or max_polls, for tests). Closes the CSV on exit."""
         if self.a.hold_current:
             _, dev = self.hub.state()
             for name in CHANNELS:
@@ -926,6 +1103,8 @@ class Holder:
                 self.csv_f.close()
 
     def _loop(self, max_polls):
+        """Poll/render at a fixed cadence. A CommError is counted, shown and the port closed;
+        the next poll re-opens it (Hub.xfer -> open), so USB drops are ridden out."""
         n = 0
         while max_polls is None or n < max_polls:
             n += 1
@@ -942,6 +1121,7 @@ class Holder:
 
 
 def cmd_hold(hub, a):
+    """hold (also the default command): run Holder until Ctrl+C, which leaves settings as-is."""
     if a.interval < 1:
         print("error: --interval must be at least 1 s", file=sys.stderr)
         return 2
@@ -959,12 +1139,14 @@ def cmd_hold(hub, a):
 # ------------------------------------------------------------------------------------------
 class Keys:
     """Non-blocking key reader. read(timeout) returns tokens: 'up', 'down', 'left', 'right',
-    'enter', 'esc', 'backspace', 'ctrl-c', or single printable characters."""
+    'enter', 'esc', 'backspace', 'tab', 'ctrl-c', or single printable characters."""
 
     WIN_SPECIAL = {"H": "up", "P": "down", "K": "left", "M": "right"}
     ANSI = {"A": "up", "B": "down", "C": "right", "D": "left"}
 
     def __enter__(self):
+        """POSIX: put stdin in cbreak mode (per-key input, no echo) and remember the old mode.
+        Windows needs no setup: msvcrt reads the console per key already."""
         self.saved = None
         if os.name != "nt":
             import termios
@@ -975,6 +1157,7 @@ class Keys:
         return self
 
     def __exit__(self, *exc):
+        """Restore the saved terminal mode (POSIX)."""
         if self.saved is not None:
             import termios
             try:
@@ -984,10 +1167,12 @@ class Keys:
 
     @staticmethod
     def _single(c):
+        """Map one control character to its token name; printable characters pass through."""
         return {"\r": "enter", "\n": "enter", "\x1b": "esc", "\x7f": "backspace", "\x08": "backspace",
                 "\x03": "ctrl-c", "\t": "tab"}.get(c, c)
 
     def read(self, timeout):
+        """Wait up to `timeout` s for input; return all key tokens available (possibly [])."""
         return self._read_win(timeout) if os.name == "nt" else self._read_posix(timeout)
 
     def _read_win(self, timeout):
@@ -1008,6 +1193,8 @@ class Keys:
             time.sleep(0.02)
 
     def _read_posix(self, timeout):
+        """Arrows arrive as ESC [ A..D (or ESC O A..D in application-cursor mode); anything else
+        after ESC is reported as a bare 'esc' followed by the characters themselves."""
         import select
         r, _, _ = select.select([self.fd], [], [], max(0.0, timeout))
         if not r:
@@ -1031,6 +1218,7 @@ class Keys:
 
 # Selectable rows: the 7 outputs, then the three level channels
 TUI_ROWS = [("out", i) for i in range(len(OUTPUTS))] + [("ch", n) for n in CHANNELS]
+# Left/Right step sizes in raw units: 0.5 V for ADJ (~8 raw), 5 % for PWM (~13 raw)
 COARSE = {"adj": round(0.5 * RAW_FULL / ADJ_VMAX), "pwm1": round(0.05 * RAW_FULL), "pwm2": round(0.05 * RAW_FULL)}
 PWM1_SOFT_MAX = round(0.80 * RAW_FULL)      # above this PWM1 tends to cycle at the cutoff edge
 DEBOUNCE_S = 0.6                            # level keys are batched into one write after this idle time
@@ -1041,9 +1229,15 @@ KEY_HELP = ["Up/Dn j/k select   Space/Enter toggle output   a all on   x all off
 
 class Tui:
     """Live status display with keyboard control. Reuses Holder for polling, stats, CSV and
-    (optional) enforcement: a channel marked 'hold' is re-pushed exactly as in hold mode."""
+    (optional) enforcement: a channel marked 'hold' is re-pushed exactly as in hold mode.
+
+    Level keys don't write immediately: steps accumulate in `pending` and are sent as one write
+    DEBOUNCE_S after the last key (flush_pending), so holding an arrow key doesn't flood the hub.
+    Typed values (e) and output switches are sent at once. Switching an output off, and all off,
+    ask y/N first. Every write is followed by an immediate poll. keys/out are injectable for tests."""
 
     def __init__(self, a, hub, keys=None, out=None):
+        """a: parsed tui args; hub: Hub (or test double); keys: Keys-like; out: text stream."""
         self.a, self.hub = a, hub
         self.holder = Holder(a, hub)
         self.keys = keys or Keys()
@@ -1059,14 +1253,17 @@ class Tui:
 
     # --- helpers -------------------------------------------------------------------------
     def row(self):
+        """(kind, which) of the selected row: ("out", index) or ("ch", channel name)."""
         return TUI_ROWS[self.sel]
 
     def note(self, text, log=True):
+        """Show text on the message line; also add it to the event log unless log=False."""
         self.msg = text
         if log:
             self.holder.event(text)
 
     def current(self, name):
+        """Channel's effective raw level: the pending (unsent) value if any, else last read."""
         if name in self.pending:
             return self.pending[name][0]
         return self.last["dev"][name] if self.last else None
@@ -1086,12 +1283,16 @@ class Tui:
 
     # --- actions -------------------------------------------------------------------------
     def set_output(self, i, on):
+        """Switch one output (verified by Hub.set_output). Untested on hardware."""
         self.act(lambda: self.hub.set_output(i, on), f"{OUTPUTS[i]} switched {'ON' if on else 'off'}")
 
     def set_all(self, on):
+        """Firmware all-on / all-off. Untested on hardware."""
         self.act(lambda: self.hub.set_all(on), f"all outputs switched {'ON' if on else 'off'}")
 
     def apply_level(self, name, raw):
+        """Write a level now. If the channel is held, its hold target moves to the new value
+        first, so the holder doesn't revert the user's change on the next poll."""
         t = self.holder.targets
         prev = t.get(name)
         if name in t:
@@ -1112,6 +1313,8 @@ class Tui:
                  + (", held" if name in t else ""))
 
     def flush_pending(self, force=False):
+        """Send pending levels idle for DEBOUNCE_S (all of them if force, e.g. on quit). A value
+        equal to the last reading is dropped without a write."""
         now = time.monotonic()
         for name, (raw, t) in list(self.pending.items()):
             if force or now - t >= DEBOUNCE_S:
@@ -1120,6 +1323,8 @@ class Tui:
                     self.apply_level(name, raw)
 
     def step(self, name, delta):
+        """Queue current level + delta (debounced). PWM is capped at RAW_FULL (the app's 100 %);
+        ADJ may go to RAW_MAX."""
         cur = self.current(name)
         if cur is None:
             self.note("no reading yet", log=False)
@@ -1129,6 +1334,8 @@ class Tui:
         self.msg = f"{name.upper()} -> {fmt_level(name, raw)} (raw {raw}), sending when you stop pressing"
 
     def toggle_hold(self, name):
+        """Start holding a channel at its current level, or stop holding it. Holding PWM1 while
+        the cutoff has it at 0 adopts 0 as the target, so that case is warned about."""
         t = self.holder.targets
         if name in t:
             del t[name]
@@ -1144,11 +1351,13 @@ class Tui:
         self.note(f"{name.upper()} held at {fmt_level(name, cur)} (raw {cur}){warn}")
 
     def confirm(self, label, fn):
+        """Ask y/N on the message line; fn runs only on y/Y (see _handle_prompt)."""
         self.prompt = ("confirm", label, fn)
         self.msg = ""
 
     # --- input ---------------------------------------------------------------------------
     def handle(self, k):
+        """Dispatch one key token. An open prompt (confirm / value entry) takes all keys."""
         if self.prompt:
             return self._handle_prompt(k)
         kind, which = self.row()
@@ -1187,6 +1396,8 @@ class Tui:
             self.toggle_hold(which)
 
     def _handle_prompt(self, k):
+        """confirm: y/Y runs the action, any other key cancels. edit: build the buffer; Enter
+        parses it with parse_level() and writes at once (dropping any pending step), Esc cancels."""
         kind = self.prompt[0]
         if kind == "confirm":
             _, _, fn = self.prompt
@@ -1219,6 +1430,8 @@ class Tui:
 
     # --- polling -------------------------------------------------------------------------
     def poll(self):
+        """Holder.poll() with comm errors shown instead of raised; schedules the next poll.
+        On error the last good reading stays on screen, marked stale."""
         try:
             self.last = self.holder.poll()
             self.err = None
@@ -1231,6 +1444,10 @@ class Tui:
 
     # --- drawing -------------------------------------------------------------------------
     def lines(self, width, height):
+        """Build the screen as a list of at most `height` lines, each clipped to `width` visible
+        columns. Selectable rows are tuples ("sel", row index, text[, tail]) until _fmt() renders
+        them (highlighted when selected). The event list fills leftover height; on a short
+        terminal the body is cut, never the prompt/help footer."""
         s, h = self.last, self.holder
         up = int(time.time() - h.started)
         L = [f"{BOLD}SV241 Pro @ {self.hub.port or '?'}{RST}   {time.strftime('%Y-%m-%d %H:%M:%S')}   "
@@ -1295,6 +1512,7 @@ class Tui:
         return [self._fmt(x, width) for x in L][-height:] if height > 0 else []
 
     def _fmt(self, x, width):
+        """Render one lines() entry; a selected row gets reverse video and a '>' marker."""
         if isinstance(x, str):
             return clip(x, width)
         _, idx, text, *extra = x
@@ -1304,6 +1522,8 @@ class Tui:
         return clip(text + tail, width)
 
     def render(self):
+        """Repaint in place: cursor home, each line erased-then-written, clear below. No full
+        clear per frame, so the display doesn't flicker."""
         size = shutil.get_terminal_size((100, 40))
         body = "".join("\033[K" + ln + RST + "\n" for ln in self.lines(size.columns, size.lines))
         self.out.write("\033[H" + body.rstrip("\n") + "\033[J")
@@ -1311,6 +1531,11 @@ class Tui:
 
     # --- main loop -----------------------------------------------------------------------
     def run(self):
+        """Main loop until q / Ctrl+C: poll on schedule, flush debounced writes, read keys
+        (short waits so debounce and redraws stay timely), redraw when something changed and at
+        least once a second for the clock. Uses the alternate screen; SIGTERM/SIGHUP are turned
+        into KeyboardInterrupt so the terminal is always restored. Pending writes are flushed on
+        exit; the CSV is closed."""
         h = self.holder
         if self.a.hold_current:
             _, dev = self.hub.state()
@@ -1375,10 +1600,11 @@ class Tui:
                 h.csv_f.close()
 
 
-ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")   # CSI escape sequences (colours, cursor moves)
 
 
 def visible_len(s):
+    """Length of s as displayed, ignoring ANSI escape sequences."""
     return len(ANSI_RE.sub("", s))
 
 
@@ -1402,6 +1628,7 @@ def clip(s, width):
 
 
 def cmd_tui(hub, a):
+    """tui: interactive mode. Needs a real console on stdin and stdout (refuses pipes/mintty)."""
     if a.interval < 1:
         print("error: --interval must be at least 1 s", file=sys.stderr)
         return 2
@@ -1419,6 +1646,7 @@ def cmd_tui(hub, a):
 # CLI
 # ------------------------------------------------------------------------------------------
 def build_parser():
+    """argparse tree: global --port/--timeout, then one subcommand (see COMMANDS)."""
     ap = argparse.ArgumentParser(prog="sv241", description="Control and monitor an SVBONY SV241 Pro. "
                                  "With no command, runs 'hold'.")
     ap.add_argument("--port", help="COMx, /dev/ttyUSBx (Linux) or /dev/cu.usbserial-x / "
@@ -1485,6 +1713,10 @@ def insert_default_command(argv):
 
 
 def main(argv=None, hub_factory=None):
+    """CLI entry point; returns the exit code. `set` levels and `on`/`off` names are
+    validated before the port is opened, so those typos never touch the hub. `raw` hex bytes
+    are not pre-validated: a bad one raises ValueError from cmd_raw after the port is open.
+    hub_factory replaces Hub (tests/fake_hub.py)."""
     argv = sys.argv[1:] if argv is None else argv
     a = build_parser().parse_args(insert_default_command(argv))
     try:
