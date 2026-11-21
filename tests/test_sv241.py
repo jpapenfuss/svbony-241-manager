@@ -1,4 +1,16 @@
-"""Simulator-backed tests: python -m unittest discover -s tests"""
+"""
+Simulator-backed tests for sv241.py: python -m unittest discover -s tests
+
+No hardware or pyserial needed. Most tests drive sv241 against tests/fake_hub.py (FakeSerial /
+FakeHub). Coverage:
+  TuiTests         key handling, confirmations, debounced writes, holds, PWM1 cutoff refusal,
+                   rendering limits, comm errors (Tui driven directly; no real terminal)
+  KeyParseTests    POSIX escape-sequence parsing over a pipe
+  CliTests         default-command routing (old hold.py command lines), one-shot commands
+  PosixSerialTests the stdlib termios backend end to end over a pty pair (POSIX only)
+  PortPickTests    auto-detect rules: CH340 preference, cu.* over tty.*, guarded guesses
+Hardware-only behaviour (real DTR/RTS reset, boot banner, sensor timing) is not covered.
+"""
 import io
 import os
 import sys
@@ -10,6 +22,7 @@ from fake_hub import FakeHub, FakeSerial, sv241  # noqa: E402
 
 
 def new_tui(*argv):
+    """Fresh simulator + Tui parsed from `tui *argv`, output to a StringIO, one poll done."""
     FakeHub.sim = FakeSerial()
     a = sv241.build_parser().parse_args(["tui", *argv])
     hub = FakeHub(None, 0.4)
@@ -19,6 +32,7 @@ def new_tui(*argv):
 
 
 def select(t, kind, which):
+    """Move the TUI selection to row (kind, which), e.g. ("ch", "pwm2")."""
     t.sel = sv241.TUI_ROWS.index((kind, which))
 
 
