@@ -319,7 +319,7 @@ class PosixSerial:
     confirmed on this hub, so treat a "hub REBOOTED" event on POSIX open as a sign it is wrong.)"""
 
     def __init__(self, port, baudrate=BAUD, timeout=0.05):
-        """Open and configure `port`; raises CommError (busy, permission, not a tty).
+        """Open and configure `port`; raises CommError (busy, permission, not a tty, bad baud).
 
         O_NONBLOCK keeps open() from waiting on carrier detect; reads still honour `timeout` via
         select() in read(). O_NOCTTY stops the port becoming our controlling terminal."""
@@ -362,7 +362,9 @@ class PosixSerial:
             cflag &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | termios.HUPCL
                        | getattr(termios, "CRTSCTS", 0))
             cflag |= termios.CS8 | termios.CLOCAL | termios.CREAD
-            speed = getattr(termios, f"B{baudrate}")
+            speed = getattr(termios, f"B{baudrate}", None)
+            if speed is None:
+                raise CommError(f"baud rate {baudrate} not supported by termios on this OS")
             cc = list(cc)
             cc[termios.VMIN], cc[termios.VTIME] = 0, 0     # reads return at once; select() times them
             termios.tcsetattr(self.fd, termios.TCSANOW, [iflag, oflag, cflag, lflag, speed, speed, cc])
@@ -554,11 +556,15 @@ class Hub:
 
     def _scan_unsolicited(self):
         """Consume any bytes nobody asked for. The hub only sends unprompted output at boot
-        ("SV241Pro V1.3 ..."), so finding that text means it reset; latch reboot_seen."""
-        n = getattr(self.ser, "in_waiting", 0)
-        if n:
-            if b"SV241Pro" in self.ser.read(n):
+        ("SV241Pro V1.3 ..."), so finding that text means it reset; latch reboot_seen.
+        An I/O error here closes the port and raises CommError (xfer passes it through)."""
+        try:
+            n = getattr(self.ser, "in_waiting", 0)
+            if n and b"SV241Pro" in self.ser.read(n):
                 self.reboot_seen = True
+        except Exception as e:                    # port vanished between open and first read
+            self.close()
+            raise CommError(f"serial I/O failed on {self.port}: {e}")
 
     def xfer(self, tx, expect):
         """Send frame tx, return up to `expect` reply bytes (fewer on timeout; caller validates).
@@ -575,6 +581,8 @@ class Hub:
             end = time.monotonic() + self.timeout
             while len(buf) < expect and time.monotonic() < end:
                 buf += self.ser.read(expect - len(buf))
+        except CommError:
+            raise                                  # already worded (and port closed)
         except Exception as e:
             self.close()
             raise CommError(f"serial I/O failed on {self.port}: {e}")
@@ -687,7 +695,10 @@ def parse_level(name, s):
         x = float(s.rstrip("v" if name == "adj" else "%"))
         if not math.isfinite(x):
             raise ValueError(f"{name}: {s} is not a number")
-        raw = round(x * RAW_FULL / (ADJ_VMAX if name == "adj" else 100.0))
+        x *= RAW_FULL / (ADJ_VMAX if name == "adj" else 100.0)
+        if not math.isfinite(x) or abs(x) > 1e6:            # 1e308 overflows to inf above
+            raise ValueError(f"{name}: {s} is outside raw 0..{RAW_MAX}")
+        raw = round(x)
     if not 0 <= raw <= RAW_MAX:
         raise ValueError(f"{name}: {s} is outside raw 0..{RAW_MAX}")
     return raw
@@ -836,7 +847,7 @@ def cmd_ports(_a):
     ports = list_serial_ports()
     for dev, vid, pid, desc in ports:
         tag = "  <- CH340 (SV241 Pro?)" if (vid, pid) == CH340 else ""
-        ids = f"{vid:04X}:{pid:04X}" if vid is not None else "????:????"
+        ids = f"{vid:04X}:{pid:04X}" if vid is not None and pid is not None else "????:????"
         print(f"{dev:<28} {ids}  {desc}{tag}")
     if not ports:
         print("no serial ports found")
@@ -1145,7 +1156,10 @@ class Keys:
         """Restore the saved terminal mode (POSIX)."""
         if self.saved is not None:
             import termios
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            except (termios.error, OSError):      # tty hung up
+                pass
 
     @staticmethod
     def _single(c):
@@ -1283,10 +1297,12 @@ class Tui:
         def write():
             try:
                 self.hub.set_channel(name, raw)
-            except Refused:
+            except Refused as e:
                 # A held PWM1 refused by the dew cutoff keeps its new target (the holder restores
                 # it when the cutoff clears); any other refusal reverts to the previous target.
-                if prev is not None and not (name == "pwm1" and self.holder.in_cutoff):
+                # firmware only refuses PWM1 for the cutoff; set_channel says so in the message
+                cutoff = name == "pwm1" and (self.holder.in_cutoff or "dew cutoff" in str(e))
+                if prev is not None and not cutoff:
                     t[name] = prev
                 raise
         self.act(write, f"{name.upper()} set to {fmt_level(name, raw)} (raw {raw})"
@@ -1473,7 +1489,7 @@ class Tui:
             elif lens is None:
                 L.append("  Lens probe not connected: PWM1 cutoff cannot trigger")
         # footer: message/prompt + key help, events fill whatever height is left
-        foot = [""]
+        foot = ["", *(f"{DIM}{k}{RST}" for k in KEY_HELP)]   # prompt goes last: kept on tiny screens
         if self.prompt and self.prompt[0] == "edit":
             _, name, buf = self.prompt
             unit = "volts" if name == "adj" else "percent"
@@ -1482,7 +1498,6 @@ class Tui:
             foot.append(f"{BOLD}{YEL}{self.prompt[1]}{RST}")
         else:
             foot.append(self.msg)
-        foot.extend(f"{DIM}{k}{RST}" for k in KEY_HELP)
         room = height - len(L) - len(foot) - 2
         if room > 0:
             ev = list(h.events)[-room:]
@@ -1490,7 +1505,7 @@ class Tui:
             L.append(f"{DIM}  Events{RST}")
             L.extend("  " + e for e in ev)
         L = L[:max(0, height - len(foot))] + foot   # short terminal: cut the body, never the prompt
-        return [self._fmt(x, width) for x in L][-height:]
+        return [self._fmt(x, width) for x in L][-height:] if height > 0 else []
 
     def _fmt(self, x, width):
         """Render one lines() entry; a selected row gets reverse video and a '>' marker."""
@@ -1499,7 +1514,7 @@ class Tui:
         _, idx, text, *extra = x
         tail = extra[0] if extra else ""
         if idx == self.sel:
-            return REV + ">" + clip(text, width - 1)[1:] + RST + clip(tail, width - visible_len(text))
+            return clip(REV + ">" + text[1:] + RST + tail, width)    # same width rule as below
         return clip(text + tail, width)
 
     def render(self):
@@ -1530,13 +1545,13 @@ class Tui:
 
         def stop(*_):
             raise KeyboardInterrupt
-        for name in ("SIGTERM", "SIGHUP"):        # window closed / kill: still restore the tty
-            if hasattr(signal, name):
-                try:
-                    old_sig[name] = signal.signal(getattr(signal, name), stop)
-                except (ValueError, OSError):    # not the main thread
-                    pass
         try:
+            for name in ("SIGTERM", "SIGHUP"):    # window closed / kill: still restore the tty
+                if hasattr(signal, name):
+                    try:
+                        old_sig[name] = signal.signal(getattr(signal, name), stop)
+                    except (ValueError, OSError):  # not the main thread
+                        pass
             with self.keys:
                 while not self.quit:
                     dirty = False
@@ -1566,10 +1581,17 @@ class Tui:
                 self.flush_pending(force=True)
             except Exception:
                 pass
-            self.out.write(RST + "\033[?25h\033[?1049l")
-            self.out.flush()
+            try:
+                self.out.write(RST + "\033[?25h\033[?1049l")
+                self.out.flush()
+            except OSError:                       # terminal already gone (SIGHUP)
+                pass
             for name, old in old_sig.items():
-                signal.signal(getattr(signal, name), old)
+                if old is not None:
+                    try:
+                        signal.signal(getattr(signal, name), old)
+                    except (ValueError, OSError, TypeError):
+                        pass
             if h.csv:
                 h.csv_f.close()
 

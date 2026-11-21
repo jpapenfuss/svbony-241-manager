@@ -92,7 +92,7 @@ class TuiTests(unittest.TestCase):
     def test_non_finite_value_is_rejected(self):
         t, sim = new_tui()
         select(t, "ch", "pwm2")
-        for v in ("inf", "-1e400", "nan"):
+        for v in ("inf", "-1e400", "nan", "1e308", "raw:9999"):
             for k in ["e", *v, "enter"]:
                 t.handle(k)
             self.assertIn("bad value", t.msg)
@@ -121,6 +121,32 @@ class TuiTests(unittest.TestCase):
         ls = t.lines(80, 24)
         self.assertEqual(len(ls), 24)
         self.assertTrue(any("Enter to send" in ln for ln in ls))
+
+    def test_selected_row_keeps_status_text(self):
+        t, _ = new_tui()
+        select(t, "ch", "pwm1")
+        row = [ln for ln in t.lines(130, 48) if "PWM1" in ln and ">" in ln][0]
+        self.assertIn("cycles at cutoff edge", row)
+        for w in (20, 40, 60):
+            self.assertLessEqual(max(sv241.visible_len(ln) for ln in t.lines(w, 48)), w)
+
+    def test_prompt_survives_tiny_terminal(self):
+        t, _ = new_tui()
+        select(t, "ch", "pwm1")
+        t.handle("e")
+        self.assertIn("Enter to send", t.lines(80, 1)[-1])
+        self.assertEqual(t.lines(80, 0), [])
+
+    def test_pwm1_refusal_keeps_target_when_cutoff_predicted(self):
+        t, sim = new_tui()
+        select(t, "ch", "pwm1")
+        t.handle("h")
+        sim.cutoff, sim.saved_pwm1, sim.ch[8], sim.lens_t = True, 253, 0, 30.0
+        self.assertFalse(t.holder.in_cutoff)                    # poll hasn't noticed yet
+        for k in ["e", *"70", "enter"]:
+            t.handle(k)
+        self.assertIn("REFUSED", t.msg)
+        self.assertEqual(t.holder.targets["pwm1"], sv241.parse_level("pwm1", "70"))
 
     def test_pwm_step_capped_at_100(self):
         t, sim = new_tui()
@@ -173,6 +199,17 @@ class TuiTests(unittest.TestCase):
             self.assertLessEqual(len(ls), h)
             for ln in ls:
                 self.assertLessEqual(sv241.visible_len(ln), w, ln)
+
+    def test_scan_error_not_double_wrapped(self):
+        t, sim = new_tui()
+        t.hub.open()
+        type(sim).in_waiting = property(lambda s: (_ for _ in ()).throw(OSError("gone")))
+        try:
+            with self.assertRaises(sv241.CommError) as cm:
+                t.hub.state()
+            self.assertEqual(str(cm.exception).count("serial I/O failed"), 1)
+        finally:
+            type(sim).in_waiting = 0
 
     def test_comm_error_is_reported_not_fatal(self):
         t, sim = new_tui()
@@ -257,6 +294,10 @@ class PosixSerialTests(unittest.TestCase):
         os.close(self.master)
         os.close(self.slave)
 
+    def test_unsupported_baud_is_comm_error(self):
+        with self.assertRaises(sv241.CommError):
+            sv241.PosixSerial(self.dev, baudrate=123457)
+
     def test_hub_over_termios(self):
         orig = sv241.have_pyserial
         sv241.have_pyserial = lambda: False
@@ -301,6 +342,16 @@ class PortPickTests(unittest.TestCase):
     def test_non_tty_is_comm_error(self):
         with self.assertRaises(sv241.CommError):
             sv241.PosixSerial("/dev/null")
+
+    def test_ports_listing_tolerates_missing_pid(self):
+        orig = sv241.list_serial_ports
+        sv241.list_serial_ports = lambda: [("/dev/ttyUSB0", 0x1A86, None, "odd")]
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(sv241.cmd_ports(None), 0)
+            self.assertIn("????:????", out.getvalue())
+        finally:
+            sv241.list_serial_ports = orig
 
     def test_nothing(self):
         with self.assertRaises(sv241.CommError):
