@@ -241,5 +241,108 @@ class CliTests(unittest.TestCase):
         self.assertIn("interactive console", e.getvalue())
 
 
+@unittest.skipIf(os.name == "nt", "POSIX termios backend")
+class PosixSerialTests(unittest.TestCase):
+    """Runs the stdlib termios backend over a pty pair, with the simulator answering on the
+    master side: the full Hub path, minus a real USB adapter."""
+
+    def setUp(self):
+        import pty
+        import threading
+        self.master, self.slave = pty.openpty()      # keep slave open: else master reads hit EIO
+        self.dev = os.ttyname(self.slave)
+        self.sim = FakeSerial()
+        self.stop = False
+
+        def serve():
+            import select
+            buf = b""
+            while not self.stop:
+                r, _, _ = select.select([self.master], [], [], 0.05)
+                if not r:
+                    continue
+                try:
+                    buf += os.read(self.master, 256)
+                except OSError:
+                    return
+                while len(buf) >= 6:
+                    self.sim.write(buf[:6])
+                    buf = buf[6:]
+                    if self.sim.rx:
+                        os.write(self.master, bytes(self.sim.rx))
+                        self.sim.rx.clear()
+        self.t = threading.Thread(target=serve, daemon=True)
+        self.t.start()
+
+    def tearDown(self):
+        self.stop = True
+        self.t.join(1)
+        os.close(self.master)
+        os.close(self.slave)
+
+    def test_unsupported_baud_is_comm_error(self):
+        with self.assertRaises(sv241.CommError):
+            sv241.PosixSerial(self.dev, baudrate=123457)
+
+    def test_hub_over_termios(self):
+        orig = sv241.have_pyserial
+        sv241.have_pyserial = lambda: False
+        try:
+            hub = sv241.Hub(self.dev, 0.4)
+            with hub:
+                self.assertIsInstance(hub.ser, sv241.PosixSerial)
+                outs, dev = hub.state()
+                self.assertEqual(outs, [True] * 7)
+                hub.set_channel("pwm2", 100)
+                hub.set_output(4, False)
+                s = hub.sensors()
+                self.assertAlmostEqual(s["input_v"], 12.4, places=2)
+                with self.assertRaises(sv241.CommError):     # flock: second opener refused
+                    sv241.PosixSerial(self.dev)
+            self.assertEqual(self.sim.ch[9], 100)
+            self.assertEqual(self.sim.outs[4], 0)
+        finally:
+            sv241.have_pyserial = orig
+
+
+class PortPickTests(unittest.TestCase):
+    def test_prefers_ch340_and_cu(self):
+        ports = [("/dev/ttyUSB0", 0x0403, 0x6001, "FTDI"), ("/dev/tty.wchusbserial1", *sv241.CH340, ""),
+                 ("/dev/cu.wchusbserial1", *sv241.CH340, ""), ("/dev/ttyUSB1", *sv241.CH340, "")]
+        self.assertEqual(sv241.pick_port(ports)[0], "/dev/cu.wchusbserial1")
+
+    def test_lone_unidentified_port_is_a_guess(self):
+        dev, note = sv241.pick_port([("/dev/cu.usbserial-1410", None, None, "USB serial"),
+                                     ("/dev/tty.usbserial-1410", None, None, "USB serial")])
+        self.assertEqual(dev, "/dev/cu.usbserial-1410")
+        self.assertIn("trying", note)
+
+    def test_non_usb_ports_are_never_guessed(self):
+        for ports in ([("COM1", None, None, "Communications Port")],
+                      [("/dev/cu.Bluetooth-Incoming-Port", None, None, "")],
+                      [("/dev/ttyS0", None, None, "")]):
+            with self.assertRaises(sv241.CommError):
+                sv241.pick_port(ports)
+
+    @unittest.skipIf(os.name == "nt", "POSIX termios backend")
+    def test_non_tty_is_comm_error(self):
+        with self.assertRaises(sv241.CommError):
+            sv241.PosixSerial("/dev/null")
+
+    def test_ports_listing_tolerates_missing_pid(self):
+        orig = sv241.list_serial_ports
+        sv241.list_serial_ports = lambda: [("/dev/ttyUSB0", 0x1A86, None, "odd")]
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(sv241.cmd_ports(None), 0)
+            self.assertIn("????:????", out.getvalue())
+        finally:
+            sv241.list_serial_ports = orig
+
+    def test_nothing(self):
+        with self.assertRaises(sv241.CommError):
+            sv241.pick_port([("/dev/ttyUSB0", 0x0403, 0x6001, "FTDI")])
+
+
 if __name__ == "__main__":
     unittest.main()

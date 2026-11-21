@@ -9,7 +9,10 @@ Protocol reference: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Requirements
 
-- Python 3 (tested on 3.13, Windows), `pip install pyserial` (tested 3.5).
+- Python 3.8+ (tested on 3.13).
+- **Windows:** `pip install pyserial` (tested 3.5).
+- **macOS / Linux:** no dependencies. pyserial is used if installed; otherwise a built-in
+  `termios` backend drives the port and auto-detect scans `/dev` (see below).
 - Hub enumerates as a CH340 (`1A86:7523`), 115200 8N1. Auto-detected if `--port` is omitted;
   `python sv241.py ports` lists ports with CH340s flagged. On the NINA PC it is `COM6`.
 - **Exclusive port.** Disconnect the hub in NINA, close the vendor app and any other copy of
@@ -38,6 +41,28 @@ python sv241.py ports
 
 Exit codes: `0` ok, `1` comm error, `2` refused by hub (e.g. PWM1 during dew cutoff) or bad
 argument. Settings persist on the hub (firmware auto-saves to flash every 5 s).
+
+### macOS / Linux
+
+Same commands, including `tui` (ANSI + `termios`; `curses` is not used so all platforms share
+one renderer). Port names and auto-detect:
+
+| OS | Device | Auto-detect |
+| --- | --- | --- |
+| Linux | `/dev/ttyUSB0` (kernel `ch341` driver) | `/dev/ttyUSB*`, `/dev/ttyACM*`; VID:PID read from sysfs |
+| macOS 10.14+ | `/dev/cu.usbserial-XXXX` (Apple CH34x driver) | `/dev/cu.*`; without pyserial VID:PID is unknown, so a lone `usbserial`/`usbmodem` port is used as a guess |
+| macOS + WCH driver | `/dev/cu.wchusbserialXXXX` | treated as CH340 by name |
+
+`python sv241.py ports` shows what it found and what auto-detect would pick. Use `cu.*`, not
+`tty.*`, on macOS (`tty.*` blocks on open waiting for carrier).
+
+Linux gotchas: add yourself to `dialout` (`uucp` on Arch) and log in again, or open fails with
+permission denied. On Ubuntu 22.04+ **brltty** claims `1A86:7523` and the port vanishes right
+after plugging in: `sudo apt remove brltty` (or mask its udev rule).
+
+DTR/RTS: POSIX kernels raise both lines on open (pyserial does too); the script drops them
+immediately and clears `HUPCL`. Both together don't trip the ESP32 auto-reset circuit, but
+this is untested on the hub; a reset shows up as a "hub REBOOTED" event.
 
 ### Hold mode
 
@@ -110,6 +135,9 @@ Hardware-tested 2026-11-21 on COM6: all reads, PWM2 write/restore, hold mode, ch
 TUI mode (`tui`): tested only against `tests/fake_hub.py` on Linux, not yet on the hub or on
 Windows (the `msvcrt` key path is untested).
 
+macOS/Linux: termios backend tested over a pty against the simulator on Linux. Not yet run on a
+real CH340 or on macOS.
+
 Open:
 
 - **DC/USB output switching untested on hardware** (`on`/`off`, all-on/off). Frames are
@@ -130,4 +158,4 @@ Open:
 | `svbony-probe.py` | Checksum experiment (0xFF vs 0x00 for sum = 255) on a PWM1 write; hard-coded COM6 |
 | `docs/PROTOCOL.md` | Wire protocol, encoding, firmware behaviour |
 | `tests/fake_hub.py` | Software SV241 Pro (frames, checksum, sensors, PWM1 cutoff); `python tests/fake_hub.py tui` runs any sv241.py command against it |
-| `tests/test_sv241.py` | Simulator tests: `python -m unittest discover -s tests` (no pyserial needed) |
+| `tests/test_sv241.py` | Simulator tests incl. termios backend over a pty: `python -m unittest discover -s tests` (no pyserial needed) |
