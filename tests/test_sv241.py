@@ -108,6 +108,14 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(len(ls), 24)
         self.assertTrue(any("Enter to send" in ln for ln in ls))
 
+    def test_selected_row_keeps_status_text(self):
+        t, _ = new_tui()
+        select(t, "ch", "pwm1")
+        row = [ln for ln in t.lines(130, 48) if "PWM1" in ln and ">" in ln][0]
+        self.assertIn("cycles at cutoff edge", row)
+        for w in (20, 40, 60):
+            self.assertLessEqual(max(sv241.visible_len(ln) for ln in t.lines(w, 48)), w)
+
     def test_pwm_step_capped_at_100(self):
         t, sim = new_tui()
         select(t, "ch", "pwm2")

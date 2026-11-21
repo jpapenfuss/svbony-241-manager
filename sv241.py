@@ -1278,7 +1278,7 @@ class Tui:
         _, idx, text, *extra = x
         tail = extra[0] if extra else ""
         if idx == self.sel:
-            return REV + ">" + clip(text, width - 1)[1:] + RST + clip(tail, width - visible_len(text))
+            return clip(REV + ">" + text[1:] + RST + tail, width)    # same width rule as below
         return clip(text + tail, width)
 
     def render(self):
