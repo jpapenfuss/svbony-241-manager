@@ -220,10 +220,13 @@ class Hub:
         self.close()
 
     def _scan_unsolicited(self):
-        n = getattr(self.ser, "in_waiting", 0)
-        if n:
-            if b"SV241Pro" in self.ser.read(n):
+        try:
+            n = getattr(self.ser, "in_waiting", 0)
+            if n and b"SV241Pro" in self.ser.read(n):
                 self.reboot_seen = True
+        except Exception as e:                    # port vanished between open and first read
+            self.close()
+            raise CommError(f"serial I/O failed on {self.port}: {e}")
 
     def xfer(self, tx, expect):
         self.open()
@@ -318,7 +321,10 @@ def parse_level(name, s):
         x = float(s.rstrip("v" if name == "adj" else "%"))
         if not math.isfinite(x):
             raise ValueError(f"{name}: {s} is not a number")
-        raw = round(x * RAW_FULL / (ADJ_VMAX if name == "adj" else 100.0))
+        x *= RAW_FULL / (ADJ_VMAX if name == "adj" else 100.0)
+        if not math.isfinite(x) or abs(x) > 1e6:            # 1e308 overflows to inf above
+            raise ValueError(f"{name}: {s} is outside raw 0..{RAW_MAX}")
+        raw = round(x)
     if not 0 <= raw <= RAW_MAX:
         raise ValueError(f"{name}: {s} is outside raw 0..{RAW_MAX}")
     return raw
@@ -711,7 +717,10 @@ class Keys:
     def __exit__(self, *exc):
         if self.saved is not None:
             import termios
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            except (termios.error, OSError):      # tty hung up
+                pass
 
     @staticmethod
     def _single(c):
@@ -834,11 +843,17 @@ class Tui:
             except Refused:
                 # A held PWM1 refused by the dew cutoff keeps its new target (the holder restores
                 # it when the cutoff clears); any other refusal reverts to the previous target.
-                if prev is not None and not (name == "pwm1" and self.holder.in_cutoff):
+                cutoff = name == "pwm1" and (self.holder.in_cutoff or self._cutoff_predicted())
+                if prev is not None and not cutoff:
                     t[name] = prev
                 raise
         self.act(write, f"{name.upper()} set to {fmt_level(name, raw)} (raw {raw})"
                  + (", held" if name in t else ""))
+
+    def _cutoff_predicted(self):
+        s = self.last
+        return bool(s and s["lens_c"] is not None and s["pwm1_cutoff_c"] is not None
+                    and s["lens_c"] > s["pwm1_cutoff_c"])
 
     def flush_pending(self, force=False):
         now = time.monotonic()
@@ -1005,7 +1020,7 @@ class Tui:
             elif lens is None:
                 L.append("  Lens probe not connected: PWM1 cutoff cannot trigger")
         # footer: message/prompt + key help, events fill whatever height is left
-        foot = [""]
+        foot = ["", *(f"{DIM}{k}{RST}" for k in KEY_HELP)]   # prompt goes last: kept on tiny screens
         if self.prompt and self.prompt[0] == "edit":
             _, name, buf = self.prompt
             unit = "volts" if name == "adj" else "percent"
@@ -1014,7 +1029,6 @@ class Tui:
             foot.append(f"{BOLD}{YEL}{self.prompt[1]}{RST}")
         else:
             foot.append(self.msg)
-        foot.extend(f"{DIM}{k}{RST}" for k in KEY_HELP)
         room = height - len(L) - len(foot) - 2
         if room > 0:
             ev = list(h.events)[-room:]
@@ -1022,7 +1036,7 @@ class Tui:
             L.append(f"{DIM}  Events{RST}")
             L.extend("  " + e for e in ev)
         L = L[:max(0, height - len(foot))] + foot   # short terminal: cut the body, never the prompt
-        return [self._fmt(x, width) for x in L][-height:]
+        return [self._fmt(x, width) for x in L][-height:] if height > 0 else []
 
     def _fmt(self, x, width):
         if isinstance(x, str):
@@ -1054,13 +1068,13 @@ class Tui:
 
         def stop(*_):
             raise KeyboardInterrupt
-        for name in ("SIGTERM", "SIGHUP"):        # window closed / kill: still restore the tty
-            if hasattr(signal, name):
-                try:
-                    old_sig[name] = signal.signal(getattr(signal, name), stop)
-                except (ValueError, OSError):    # not the main thread
-                    pass
         try:
+            for name in ("SIGTERM", "SIGHUP"):    # window closed / kill: still restore the tty
+                if hasattr(signal, name):
+                    try:
+                        old_sig[name] = signal.signal(getattr(signal, name), stop)
+                    except (ValueError, OSError):  # not the main thread
+                        pass
             with self.keys:
                 while not self.quit:
                     dirty = False
@@ -1090,10 +1104,17 @@ class Tui:
                 self.flush_pending(force=True)
             except Exception:
                 pass
-            self.out.write(RST + "\033[?25h\033[?1049l")
-            self.out.flush()
+            try:
+                self.out.write(RST + "\033[?25h\033[?1049l")
+                self.out.flush()
+            except OSError:                       # terminal already gone (SIGHUP)
+                pass
             for name, old in old_sig.items():
-                signal.signal(getattr(signal, name), old)
+                if old is not None:
+                    try:
+                        signal.signal(getattr(signal, name), old)
+                    except (ValueError, OSError, TypeError):
+                        pass
             if h.csv:
                 h.csv_f.close()
 

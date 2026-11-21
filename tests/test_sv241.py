@@ -78,7 +78,7 @@ class TuiTests(unittest.TestCase):
     def test_non_finite_value_is_rejected(self):
         t, sim = new_tui()
         select(t, "ch", "pwm2")
-        for v in ("inf", "-1e400", "nan"):
+        for v in ("inf", "-1e400", "nan", "1e308", "raw:9999"):
             for k in ["e", *v, "enter"]:
                 t.handle(k)
             self.assertIn("bad value", t.msg)
@@ -115,6 +115,24 @@ class TuiTests(unittest.TestCase):
         self.assertIn("cycles at cutoff edge", row)
         for w in (20, 40, 60):
             self.assertLessEqual(max(sv241.visible_len(ln) for ln in t.lines(w, 48)), w)
+
+    def test_prompt_survives_tiny_terminal(self):
+        t, _ = new_tui()
+        select(t, "ch", "pwm1")
+        t.handle("e")
+        self.assertIn("Enter to send", t.lines(80, 1)[-1])
+        self.assertEqual(t.lines(80, 0), [])
+
+    def test_pwm1_refusal_keeps_target_when_cutoff_predicted(self):
+        t, sim = new_tui()
+        select(t, "ch", "pwm1")
+        t.handle("h")
+        sim.cutoff, sim.saved_pwm1, sim.ch[8], sim.lens_t = True, 253, 0, 30.0
+        t.last["lens_c"], t.last["pwm1_cutoff_c"] = 30.0, 12.0   # poll hasn't noticed yet
+        for k in ["e", *"70", "enter"]:
+            t.handle(k)
+        self.assertIn("REFUSED", t.msg)
+        self.assertEqual(t.holder.targets["pwm1"], sv241.parse_level("pwm1", "70"))
 
     def test_pwm_step_capped_at_100(self):
         t, sim = new_tui()
