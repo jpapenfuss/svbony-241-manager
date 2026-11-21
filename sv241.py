@@ -45,8 +45,8 @@ Ctrl+C exits and leaves settings as they are.
 Global options go before the command: --port COM6, --timeout 0.4.
 
 One-shot exit codes: 0 success, 1 comm error, 2 hub did not take the value (e.g. PWM1 refused
-by the firmware dew cutoff) or bad argument (exception: a non-hex `raw` byte currently ends in a
-ValueError traceback, exit 1). Settings persist on the hub (it saves them to flash).
+by the firmware dew cutoff) or bad argument (all arguments, including `raw` hex bytes, are
+checked before the port is opened). Settings persist on the hub (it saves them to flash).
 
 Only one program can hold the serial port: close NINA's connection to the hub, the vendor app,
 or another running copy of this script first.
@@ -833,10 +833,29 @@ def cmd_set(hub, a):
     return 0
 
 
+def parse_raw_bytes(tokens):
+    """`raw` arguments -> list of ints. Each token is one hex byte (00..ff, optional 0x prefix);
+    at most 3 (cmd, idx, val). Raises ValueError otherwise, so main() rejects bad input with
+    exit 2 before the port is opened (frame() would otherwise silently mask values > 0xFF)."""
+    if len(tokens) > 3:
+        raise ValueError(f"raw takes at most 3 bytes (cmd idx val), got {len(tokens)}")
+    vals = []
+    for t in tokens:
+        try:
+            v = int(t, 16)
+        except ValueError:
+            raise ValueError(f"raw: '{t}' is not a hex byte") from None
+        if not 0 <= v <= 0xFF:
+            raise ValueError(f"raw: '{t}' is outside 00..ff")
+        vals.append(v)
+    return vals
+
+
 def cmd_raw(hub, a):
     """raw <cmd> [idx [val]] (hex): send one frame, print whatever arrives within the timeout.
-    Debug aid: no validation of the command, and the reply is shown even if malformed."""
-    vals = [int(x, 16) for x in a.bytes]
+    Debug aid: the command byte is not checked against the known set, and the reply is shown
+    even if malformed. Missing idx/val default to 0."""
+    vals = parse_raw_bytes(a.bytes)
     while len(vals) < 3:
         vals.append(0)
     tx = frame(*vals[:3])
@@ -1713,10 +1732,9 @@ def insert_default_command(argv):
 
 
 def main(argv=None, hub_factory=None):
-    """CLI entry point; returns the exit code. `set` levels and `on`/`off` names are
-    validated before the port is opened, so those typos never touch the hub. `raw` hex bytes
-    are not pre-validated: a bad one raises ValueError from cmd_raw after the port is open.
-    hub_factory replaces Hub (tests/fake_hub.py)."""
+    """CLI entry point; returns the exit code. `set` levels, `on`/`off` names and `raw` hex
+    bytes are validated before the port is opened (ValueError -> exit 2), so a typo never
+    touches the hub. hub_factory replaces Hub (tests/fake_hub.py)."""
     argv = sys.argv[1:] if argv is None else argv
     a = build_parser().parse_args(insert_default_command(argv))
     try:
@@ -1730,6 +1748,8 @@ def main(argv=None, hub_factory=None):
             parse_level(a.channel, a.level)          # validate before touching the port
         if a.cmd in ("on", "off") and [t.lower() for t in a.outputs] != ["all"]:
             parse_outputs(a.outputs)
+        if a.cmd == "raw":
+            parse_raw_bytes(a.bytes)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
