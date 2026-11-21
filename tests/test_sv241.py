@@ -75,6 +75,45 @@ class TuiTests(unittest.TestCase):
             t.handle(k)
         self.assertEqual(sim.ch[7], 120)
 
+    def test_non_finite_value_is_rejected(self):
+        t, sim = new_tui()
+        select(t, "ch", "pwm2")
+        for v in ("inf", "-1e400", "nan"):
+            for k in ["e", *v, "enter"]:
+                t.handle(k)
+            self.assertIn("bad value", t.msg)
+        self.assertEqual(sim.ch[9], 253)
+
+    def test_refused_write_restores_hold_target(self):
+        t, sim = new_tui()
+        select(t, "ch", "pwm2")
+        t.handle("h")
+        orig = sim.write
+
+        def clamp(b):                           # hub "accepts" but stores something else
+            orig(b)
+            if b[2] == 0x01 and b[3] == 9:
+                sim.ch[9] = 50
+        sim.write = clamp
+        for k in ["e", *"raw:120", "enter"]:
+            t.handle(k)
+        self.assertIn("REFUSED", t.msg)
+        self.assertEqual(t.holder.targets["pwm2"], 253)
+
+    def test_prompt_visible_on_small_terminal(self):
+        t, _ = new_tui()
+        select(t, "ch", "pwm1")
+        t.handle("e")
+        ls = t.lines(80, 24)
+        self.assertEqual(len(ls), 24)
+        self.assertTrue(any("Enter to send" in ln for ln in ls))
+
+    def test_pwm_step_capped_at_100(self):
+        t, sim = new_tui()
+        select(t, "ch", "pwm2")
+        t.handle("right")
+        self.assertEqual(t.pending["pwm2"][0], sv241.RAW_FULL)
+
     def test_hold_repushes_and_follows_tui_changes(self):
         t, sim = new_tui()
         select(t, "ch", "pwm2")

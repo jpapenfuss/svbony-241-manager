@@ -100,6 +100,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import sys
 import time
 
@@ -313,10 +314,11 @@ def parse_level(name, s):
     s = str(s).strip().lower()
     if s.startswith("raw:"):
         raw = int(s[4:], 0)
-    elif name == "adj":
-        raw = round(float(s.rstrip("v")) * RAW_FULL / ADJ_VMAX)
     else:
-        raw = round(float(s.rstrip("%")) * RAW_FULL / 100.0)
+        x = float(s.rstrip("v" if name == "adj" else "%"))
+        if not math.isfinite(x):
+            raise ValueError(f"{name}: {s} is not a number")
+        raw = round(x * RAW_FULL / (ADJ_VMAX if name == "adj" else 100.0))
     if not 0 <= raw <= RAW_MAX:
         raise ValueError(f"{name}: {s} is outside raw 0..{RAW_MAX}")
     return raw
@@ -742,6 +744,10 @@ class Keys:
         if not r:
             return []
         data = os.read(self.fd, 64).decode("utf-8", "ignore")
+        if data.endswith(("\x1b", "\x1b[", "\x1bO")):      # arrow sequence split across reads
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if r:
+                data += os.read(self.fd, 64).decode("utf-8", "ignore")
         out, i = [], 0
         while i < len(data):
             c = data[i]
@@ -817,11 +823,22 @@ class Tui:
         self.act(lambda: self.hub.set_all(on), f"all outputs switched {'ON' if on else 'off'}")
 
     def apply_level(self, name, raw):
-        if name in self.holder.targets:
-            self.holder.targets[name] = raw       # keep the holder from reverting the change
-        self.act(lambda: self.hub.set_channel(name, raw),
-                 f"{name.upper()} set to {fmt_level(name, raw)} (raw {raw})"
-                 + (", held" if name in self.holder.targets else ""))
+        t = self.holder.targets
+        prev = t.get(name)
+        if name in t:
+            t[name] = raw                         # keep the holder from reverting the change
+
+        def write():
+            try:
+                self.hub.set_channel(name, raw)
+            except Refused:
+                # A held PWM1 refused by the dew cutoff keeps its new target (the holder restores
+                # it when the cutoff clears); any other refusal reverts to the previous target.
+                if prev is not None and not (name == "pwm1" and self.holder.in_cutoff):
+                    t[name] = prev
+                raise
+        self.act(write, f"{name.upper()} set to {fmt_level(name, raw)} (raw {raw})"
+                 + (", held" if name in t else ""))
 
     def flush_pending(self, force=False):
         now = time.monotonic()
@@ -836,7 +853,7 @@ class Tui:
         if cur is None:
             self.note("no reading yet", log=False)
             return
-        raw = max(0, min(RAW_MAX, cur + delta))
+        raw = max(0, min(RAW_MAX if name == "adj" else RAW_FULL, cur + delta))   # PWM: 100 % max
         self.pending[name] = [raw, time.monotonic()]
         self.msg = f"{name.upper()} -> {fmt_level(name, raw)} (raw {raw}), sending when you stop pressing"
 
@@ -1004,8 +1021,8 @@ class Tui:
             L.append("")
             L.append(f"{DIM}  Events{RST}")
             L.extend("  " + e for e in ev)
-        L.extend(foot)
-        return [self._fmt(x, width) for x in L][:height]
+        L = L[:max(0, height - len(foot))] + foot   # short terminal: cut the body, never the prompt
+        return [self._fmt(x, width) for x in L][-height:]
 
     def _fmt(self, x, width):
         if isinstance(x, str):
@@ -1033,6 +1050,16 @@ class Tui:
         h.event(f"TUI started; held: {desc}")
         self.out.write("\033[?1049h\033[?25l\033[2J")      # alternate screen, hide cursor
         last_draw = 0.0
+        old_sig = {}
+
+        def stop(*_):
+            raise KeyboardInterrupt
+        for name in ("SIGTERM", "SIGHUP"):        # window closed / kill: still restore the tty
+            if hasattr(signal, name):
+                try:
+                    old_sig[name] = signal.signal(getattr(signal, name), stop)
+                except (ValueError, OSError):    # not the main thread
+                    pass
         try:
             with self.keys:
                 while not self.quit:
@@ -1065,6 +1092,10 @@ class Tui:
                 pass
             self.out.write(RST + "\033[?25h\033[?1049l")
             self.out.flush()
+            for name, old in old_sig.items():
+                signal.signal(getattr(signal, name), old)
+            if h.csv:
+                h.csv_f.close()
 
 
 ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
