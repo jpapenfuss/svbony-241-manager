@@ -40,7 +40,8 @@ python sv241.py ports
 ```
 
 Exit codes: `0` ok, `1` comm error, `2` refused by hub (e.g. PWM1 during dew cutoff) or bad
-argument. Settings persist on the hub (firmware auto-saves to flash every 5 s).
+argument (exception: a non-hex `raw` byte currently ends in a traceback, exit 1). Settings
+persist on the hub (firmware auto-saves to flash every 5 s).
 
 ### macOS / Linux
 

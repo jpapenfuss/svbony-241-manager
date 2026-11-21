@@ -45,7 +45,8 @@ Ctrl+C exits and leaves settings as they are.
 Global options go before the command: --port COM6, --timeout 0.4.
 
 One-shot exit codes: 0 success, 1 comm error, 2 hub did not take the value (e.g. PWM1 refused
-by the firmware dew cutoff) or bad argument. Settings persist on the hub (it saves them to flash).
+by the firmware dew cutoff) or bad argument (exception: a non-hex `raw` byte currently ends in a
+ValueError traceback, exit 1). Settings persist on the hub (it saves them to flash).
 
 Only one program can hold the serial port: close NINA's connection to the hub, the vendor app,
 or another running copy of this script first.
