@@ -284,7 +284,8 @@ class Hub:
     def set_raw(self, idx, val):
         """Send CMD 01; returns the ack status 'ok', 'refused' or 'noack'."""
         ack = self.xfer(frame(0x01, idx, val), 6)
-        if len(ack) == 6 and ack[2] == 0x01 and ack[3] == idx:
+        if (len(ack) == 6 and ack[0] == 0x24 and ack[1] == 0x06 and ack[2] == 0x01
+                and ack[3] == idx and checksum_ok(ack)):
             return "ok" if ack[4] == 0xFF else "refused"
         return "noack"
 
@@ -668,6 +669,13 @@ class Holder:
         desc = ", ".join(f"{k.upper()}={fmt_level(k, v)} (raw {v})" for k, v in self.targets.items()) \
             or "none (monitor only)"
         self.event(f"started; targets: {desc}")
+        try:
+            self._loop(max_polls)
+        finally:
+            if self.csv:
+                self.csv_f.close()
+
+    def _loop(self, max_polls):
         n = 0
         while max_polls is None or n < max_polls:
             n += 1
