@@ -247,6 +247,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual(FakeHub.sim.outs[2], 0)
         self.assertEqual(FakeHub.sim.ch[9], 77)
 
+    def test_raw_bad_bytes_exit_2_without_opening(self):
+        from contextlib import redirect_stderr
+        for args in (["zz"], ["08", "1ff"], ["01", "08", "10", "00"], ["1_0"], ["+8"], [" 8"],
+                     ["-1"], ["0x"], [""]):
+            FakeHub.sim = None
+            with redirect_stderr(io.StringIO()) as e:
+                self.assertEqual(sv241.main(["raw", *args], hub_factory=FakeHub), 2, args)
+            self.assertIn("raw", e.getvalue())
+            self.assertIsNone(FakeHub.sim, "port must not be opened")
+
+    def test_raw_good_bytes(self):
+        FakeHub.sim = FakeSerial()
+        with redirect_stdout(io.StringIO()) as o:
+            self.assertEqual(sv241.main(["raw", "0x08"], hub_factory=FakeHub), 0)
+        self.assertIn("tx 24 06 08 00 00 32", o.getvalue())
+        self.assertEqual(sv241.parse_raw_bytes(["1", "ff", "0x0a"]), [1, 255, 10])
+
     def test_tui_refuses_non_tty(self):
         from contextlib import redirect_stderr
         with redirect_stderr(io.StringIO()) as e:
