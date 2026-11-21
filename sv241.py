@@ -239,6 +239,8 @@ class Hub:
             end = time.monotonic() + self.timeout
             while len(buf) < expect and time.monotonic() < end:
                 buf += self.ser.read(expect - len(buf))
+        except CommError:
+            raise                                  # already worded (and port closed)
         except Exception as e:
             self.close()
             raise CommError(f"serial I/O failed on {self.port}: {e}")
@@ -840,20 +842,16 @@ class Tui:
         def write():
             try:
                 self.hub.set_channel(name, raw)
-            except Refused:
+            except Refused as e:
                 # A held PWM1 refused by the dew cutoff keeps its new target (the holder restores
                 # it when the cutoff clears); any other refusal reverts to the previous target.
-                cutoff = name == "pwm1" and (self.holder.in_cutoff or self._cutoff_predicted())
+                # firmware only refuses PWM1 for the cutoff; set_channel says so in the message
+                cutoff = name == "pwm1" and (self.holder.in_cutoff or "dew cutoff" in str(e))
                 if prev is not None and not cutoff:
                     t[name] = prev
                 raise
         self.act(write, f"{name.upper()} set to {fmt_level(name, raw)} (raw {raw})"
                  + (", held" if name in t else ""))
-
-    def _cutoff_predicted(self):
-        s = self.last
-        return bool(s and s["lens_c"] is not None and s["pwm1_cutoff_c"] is not None
-                    and s["lens_c"] > s["pwm1_cutoff_c"])
 
     def flush_pending(self, force=False):
         now = time.monotonic()
