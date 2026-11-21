@@ -1,6 +1,6 @@
 # svbony-241-manager
 
-Command-line control and monitoring for the **SVBONY SV241 Pro** power hub (firmware V1.3) over its
+Command-line and interactive (TUI) control and monitoring for the **SVBONY SV241 Pro** power hub (firmware V1.3) over its
 USB serial port, without the vendor app. Switch DC/USB outputs, set dew heaters (PWM1/PWM2) and ADJ
 OUT, read input V/current/power, lens and ambient temperature, humidity; or run a long-lived hold
 loop that keeps heater/ADJ targets enforced.
@@ -57,6 +57,37 @@ python sv241.py --pwm1 40 --no-clear      # plain event log (services/redirects)
 
 Other hold flags: `--events N` (recent events shown).
 
+### Interactive mode (TUI)
+
+Live display plus keyboard control. Same polling, stats, CSV and enforcement as hold mode;
+defaults to a 2 s poll. Stdlib only (ANSI escapes + `msvcrt` on Windows, `termios`/`select` on
+POSIX); no `curses`/`windows-curses` needed.
+
+```
+python sv241.py --port COM6 tui
+python sv241.py tui --pwm1 75 --interval 1   # start with PWM1 held at 75 %
+python sv241.py tui --hold-current --csv hub.csv
+```
+
+| Key | Action |
+| --- | --- |
+| Up/Down, `j`/`k` | select row (7 outputs, ADJ, PWM1, PWM2) |
+| Space / Enter (output row) | toggle; switching **off** asks `y/N` |
+| Left/Right, `-`/`+` | step ADJ ~0.5 V (8 raw), PWM 5 % (13 raw, capped at 100 %) |
+| `,` / `.` | step 1 raw |
+| `e` / Enter (channel row) | type a value: `12` (V), `40` (%), `raw:120`; Esc cancels |
+| `h` | hold/release the selected channel (re-pushed each poll, like hold mode) |
+| `a` / `x` | all outputs on / off (`x` asks `y/N`) |
+| `r` / `q` | poll now / quit (pending step is sent first; settings stay as they are) |
+
+Step keys are batched: one write 0.6 s after the last press. Every write is read back; refusals
+(e.g. PWM1 during dew cutoff) and comm errors show on the message line and in the event list,
+and the display keeps running. Rows flag the open items below: output switching unverified, ADJ
+volts approximate, PWM1 above 80 % (cutoff cycling).
+
+Needs a real console: cmd, PowerShell or Windows Terminal. In Git Bash/mintty use
+`winpty python sv241.py tui` (native Windows Python sees no TTY there and the TUI refuses to start).
+
 ### PWM1 dew cutoff
 
 Firmware forces PWM1 to 0 and refuses writes while lens probe > limit (ambient > 15 °C: dew
@@ -75,6 +106,9 @@ fully on or off. Use hold mode's Avg / Wh, not Max.
 
 Hardware-tested 2026-11-21 on COM6: all reads, PWM2 write/restore, hold mode, checksums,
 `0x04` = lens probe, base-255 sensor decode, PWM1 cutoff formula.
+
+TUI mode (`tui`): tested only against `tests/fake_hub.py` on Linux, not yet on the hub or on
+Windows (the `msvcrt` key path is untested).
 
 Open:
 
@@ -95,3 +129,5 @@ Open:
 | `sv241.py` | Controller: one-shot commands + hold mode |
 | `svbony-probe.py` | Checksum experiment (0xFF vs 0x00 for sum = 255) on a PWM1 write; hard-coded COM6 |
 | `docs/PROTOCOL.md` | Wire protocol, encoding, firmware behaviour |
+| `tests/fake_hub.py` | Software SV241 Pro (frames, checksum, sensors, PWM1 cutoff); `python tests/fake_hub.py tui` runs any sv241.py command against it |
+| `tests/test_sv241.py` | Simulator tests: `python -m unittest discover -s tests` (no pyserial needed) |

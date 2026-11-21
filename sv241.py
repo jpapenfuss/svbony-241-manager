@@ -27,6 +27,17 @@ SVBONY-hold.py command lines still work unchanged):
     python sv241.py --pwm1 40 --csv hub.csv   # also log every poll to CSV
     python sv241.py --pwm1 40 --no-clear      # plain scrolling event log (for services)
 
+Interactive mode (live display; switch outputs and change levels with the keyboard):
+
+    python sv241.py --port COM6 tui
+    python sv241.py tui --pwm1 75 --interval 1   # start with PWM1 held at 75 %
+
+    Up/Down (j/k) select a row; Space/Enter toggles an output (off asks y/N); Left/Right or -/+
+    step ADJ 0.5 V / PWM 5 %, ',' '.' step 1 raw (writes are sent 0.6 s after the last key);
+    e or Enter on a channel types an exact value (12, 40, raw:120); h holds/releases a channel
+    (re-pushed like hold mode); a all on; x all off (asks y/N); r refresh now; q quit.
+    Pure stdlib: ANSI escapes plus msvcrt (Windows) or termios (POSIX); no curses needed.
+
 Hold mode polls outputs, PWM/ADJ channels and sensors, shows them on a refreshing console display,
 and re-pushes any target the hub no longer reports. Every push is read back to confirm it took.
 Ctrl+C exits and leaves settings as they are.
@@ -87,6 +98,9 @@ import csv
 import json
 import math
 import os
+import re
+import shutil
+import signal
 import sys
 import time
 
@@ -101,7 +115,7 @@ RAW_MAX = 255
 ADJ_VMAX = 15.3
 INA_SCALE = 15.57        # vendor app's INA219 current correction
 PWR_OFFSET_MW = 269.39   # vendor app's fixed power offset
-COMMANDS = ("status", "sensors", "on", "off", "set", "raw", "ports", "hold")
+COMMANDS = ("status", "sensors", "on", "off", "set", "raw", "ports", "hold", "tui")
 
 
 class CommError(Exception):
@@ -206,10 +220,13 @@ class Hub:
         self.close()
 
     def _scan_unsolicited(self):
-        n = getattr(self.ser, "in_waiting", 0)
-        if n:
-            if b"SV241Pro" in self.ser.read(n):
+        try:
+            n = getattr(self.ser, "in_waiting", 0)
+            if n and b"SV241Pro" in self.ser.read(n):
                 self.reboot_seen = True
+        except Exception as e:                    # port vanished between open and first read
+            self.close()
+            raise CommError(f"serial I/O failed on {self.port}: {e}")
 
     def xfer(self, tx, expect):
         self.open()
@@ -222,6 +239,8 @@ class Hub:
             end = time.monotonic() + self.timeout
             while len(buf) < expect and time.monotonic() < end:
                 buf += self.ser.read(expect - len(buf))
+        except CommError:
+            raise                                  # already worded (and port closed)
         except Exception as e:
             self.close()
             raise CommError(f"serial I/O failed on {self.port}: {e}")
@@ -301,10 +320,14 @@ def parse_level(name, s):
     s = str(s).strip().lower()
     if s.startswith("raw:"):
         raw = int(s[4:], 0)
-    elif name == "adj":
-        raw = round(float(s.rstrip("v")) * RAW_FULL / ADJ_VMAX)
     else:
-        raw = round(float(s.rstrip("%")) * RAW_FULL / 100.0)
+        x = float(s.rstrip("v" if name == "adj" else "%"))
+        if not math.isfinite(x):
+            raise ValueError(f"{name}: {s} is not a number")
+        x *= RAW_FULL / (ADJ_VMAX if name == "adj" else 100.0)
+        if not math.isfinite(x) or abs(x) > 1e6:            # 1e308 overflows to inf above
+            raise ValueError(f"{name}: {s} is outside raw 0..{RAW_MAX}")
+        raw = round(x)
     if not 0 <= raw <= RAW_MAX:
         raise ValueError(f"{name}: {s} is outside raw 0..{RAW_MAX}")
     return raw
@@ -682,6 +705,467 @@ def cmd_hold(hub, a):
 
 
 # ------------------------------------------------------------------------------------------
+# TUI mode (interactive; stdlib only: ANSI escapes + msvcrt on Windows, termios/select on POSIX)
+# ------------------------------------------------------------------------------------------
+class Keys:
+    """Non-blocking key reader. read(timeout) returns tokens: 'up', 'down', 'left', 'right',
+    'enter', 'esc', 'backspace', 'ctrl-c', or single printable characters."""
+
+    WIN_SPECIAL = {"H": "up", "P": "down", "K": "left", "M": "right"}
+    ANSI = {"A": "up", "B": "down", "C": "right", "D": "left"}
+
+    def __enter__(self):
+        self.saved = None
+        if os.name != "nt":
+            import termios
+            import tty
+            self.fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)          # keeps ISIG, so Ctrl+C still raises KeyboardInterrupt
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            import termios
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            except (termios.error, OSError):      # tty hung up
+                pass
+
+    @staticmethod
+    def _single(c):
+        return {"\r": "enter", "\n": "enter", "\x1b": "esc", "\x7f": "backspace", "\x08": "backspace",
+                "\x03": "ctrl-c", "\t": "tab"}.get(c, c)
+
+    def read(self, timeout):
+        return self._read_win(timeout) if os.name == "nt" else self._read_posix(timeout)
+
+    def _read_win(self, timeout):
+        import msvcrt
+        end = time.monotonic() + timeout
+        out = []
+        while True:
+            while msvcrt.kbhit():
+                c = msvcrt.getwch()
+                if c in ("\x00", "\xe0"):       # arrow / function key prefix
+                    k = self.WIN_SPECIAL.get(msvcrt.getwch())
+                    if k:
+                        out.append(k)
+                else:
+                    out.append(self._single(c))
+            if out or time.monotonic() >= end:
+                return out
+            time.sleep(0.02)
+
+    def _read_posix(self, timeout):
+        import select
+        r, _, _ = select.select([self.fd], [], [], max(0.0, timeout))
+        if not r:
+            return []
+        data = os.read(self.fd, 64).decode("utf-8", "ignore")
+        if data.endswith(("\x1b", "\x1b[", "\x1bO")):      # arrow sequence split across reads
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if r:
+                data += os.read(self.fd, 64).decode("utf-8", "ignore")
+        out, i = [], 0
+        while i < len(data):
+            c = data[i]
+            if c == "\x1b" and i + 2 < len(data) and data[i + 1] in "[O" and data[i + 2] in self.ANSI:
+                out.append(self.ANSI[data[i + 2]])
+                i += 3
+                continue
+            out.append(self._single(c))
+            i += 1
+        return out
+
+
+# Selectable rows: the 7 outputs, then the three level channels
+TUI_ROWS = [("out", i) for i in range(len(OUTPUTS))] + [("ch", n) for n in CHANNELS]
+COARSE = {"adj": round(0.5 * RAW_FULL / ADJ_VMAX), "pwm1": round(0.05 * RAW_FULL), "pwm2": round(0.05 * RAW_FULL)}
+PWM1_SOFT_MAX = round(0.80 * RAW_FULL)      # above this PWM1 tends to cycle at the cutoff edge
+DEBOUNCE_S = 0.6                            # level keys are batched into one write after this idle time
+REV, BOLD, DIM, YEL, RED, RST = "\033[7m", "\033[1m", "\033[2m", "\033[33m", "\033[31m", "\033[0m"
+KEY_HELP = ["Up/Dn j/k select   Space/Enter toggle output   a all on   x all off   r refresh   q quit",
+            "Left/Right -/+ step 0.5 V / 5 %   , . step 1 raw   e or Enter type a value   h hold/release"]
+
+
+class Tui:
+    """Live status display with keyboard control. Reuses Holder for polling, stats, CSV and
+    (optional) enforcement: a channel marked 'hold' is re-pushed exactly as in hold mode."""
+
+    def __init__(self, a, hub, keys=None, out=None):
+        self.a, self.hub = a, hub
+        self.holder = Holder(a, hub)
+        self.keys = keys or Keys()
+        self.out = out or sys.stdout
+        self.sel = 0
+        self.last = None            # last successful poll result
+        self.err = None             # last comm error text, cleared by a good poll
+        self.msg = ""               # one-line feedback under the tables
+        self.prompt = None          # ("edit", name, buffer) | ("confirm", label, fn)
+        self.pending = {}           # channel -> [raw, monotonic time of last key]
+        self.quit = False
+        self.next_poll = 0.0
+
+    # --- helpers -------------------------------------------------------------------------
+    def row(self):
+        return TUI_ROWS[self.sel]
+
+    def note(self, text, log=True):
+        self.msg = text
+        if log:
+            self.holder.event(text)
+
+    def current(self, name):
+        if name in self.pending:
+            return self.pending[name][0]
+        return self.last["dev"][name] if self.last else None
+
+    def act(self, fn, done):
+        """Run one hub write; report the result; poll right after."""
+        try:
+            fn()
+            self.note(done)
+        except Refused as e:
+            self.note(f"REFUSED: {e}")
+        except CommError as e:
+            self.holder.counts["comm"] += 1
+            self.hub.close()
+            self.note(f"comm error: {e}")
+        self.next_poll = 0.0
+
+    # --- actions -------------------------------------------------------------------------
+    def set_output(self, i, on):
+        self.act(lambda: self.hub.set_output(i, on), f"{OUTPUTS[i]} switched {'ON' if on else 'off'}")
+
+    def set_all(self, on):
+        self.act(lambda: self.hub.set_all(on), f"all outputs switched {'ON' if on else 'off'}")
+
+    def apply_level(self, name, raw):
+        t = self.holder.targets
+        prev = t.get(name)
+        if name in t:
+            t[name] = raw                         # keep the holder from reverting the change
+
+        def write():
+            try:
+                self.hub.set_channel(name, raw)
+            except Refused as e:
+                # A held PWM1 refused by the dew cutoff keeps its new target (the holder restores
+                # it when the cutoff clears); any other refusal reverts to the previous target.
+                # firmware only refuses PWM1 for the cutoff; set_channel says so in the message
+                cutoff = name == "pwm1" and (self.holder.in_cutoff or "dew cutoff" in str(e))
+                if prev is not None and not cutoff:
+                    t[name] = prev
+                raise
+        self.act(write, f"{name.upper()} set to {fmt_level(name, raw)} (raw {raw})"
+                 + (", held" if name in t else ""))
+
+    def flush_pending(self, force=False):
+        now = time.monotonic()
+        for name, (raw, t) in list(self.pending.items()):
+            if force or now - t >= DEBOUNCE_S:
+                del self.pending[name]
+                if self.last is None or self.last["dev"][name] != raw:
+                    self.apply_level(name, raw)
+
+    def step(self, name, delta):
+        cur = self.current(name)
+        if cur is None:
+            self.note("no reading yet", log=False)
+            return
+        raw = max(0, min(RAW_MAX if name == "adj" else RAW_FULL, cur + delta))   # PWM: 100 % max
+        self.pending[name] = [raw, time.monotonic()]
+        self.msg = f"{name.upper()} -> {fmt_level(name, raw)} (raw {raw}), sending when you stop pressing"
+
+    def toggle_hold(self, name):
+        t = self.holder.targets
+        if name in t:
+            del t[name]
+            self.note(f"{name.upper()} no longer held")
+            return
+        cur = self.current(name)
+        if cur is None:
+            self.note("no reading yet", log=False)
+            return
+        t[name] = cur
+        warn = ("  (PWM1 reads 0, possibly the firmware cutoff: 0 is now the target)"
+                if name == "pwm1" and cur == 0 and self.holder.in_cutoff else "")
+        self.note(f"{name.upper()} held at {fmt_level(name, cur)} (raw {cur}){warn}")
+
+    def confirm(self, label, fn):
+        self.prompt = ("confirm", label, fn)
+        self.msg = ""
+
+    # --- input ---------------------------------------------------------------------------
+    def handle(self, k):
+        if self.prompt:
+            return self._handle_prompt(k)
+        kind, which = self.row()
+        if k in ("q", "Q", "ctrl-c"):
+            self.quit = True
+        elif k in ("up", "k"):
+            self.sel = (self.sel - 1) % len(TUI_ROWS)
+        elif k in ("down", "j", "tab"):
+            self.sel = (self.sel + 1) % len(TUI_ROWS)
+        elif k == "r":
+            self.next_poll = 0.0
+            self.msg = "refreshing"
+        elif k == "a":
+            self.set_all(True)
+        elif k == "x":
+            self.confirm("Switch ALL outputs off? [y/N]", lambda: self.set_all(False))
+        elif kind == "out" and k in (" ", "enter"):
+            if not self.last:
+                self.note("no reading yet", log=False)
+            elif self.last["outs"][which]:
+                self.confirm(f"Switch {OUTPUTS[which]} off? [y/N]", lambda: self.set_output(which, False))
+            else:
+                self.set_output(which, True)
+        elif kind == "ch" and k in ("left", "-", "_"):
+            self.step(which, -COARSE[which])
+        elif kind == "ch" and k in ("right", "+", "="):
+            self.step(which, COARSE[which])
+        elif kind == "ch" and k in (",", "<"):
+            self.step(which, -1)
+        elif kind == "ch" and k in (".", ">"):
+            self.step(which, 1)
+        elif kind == "ch" and k in ("e", "enter"):
+            self.prompt = ("edit", which, "")
+            self.msg = ""
+        elif kind == "ch" and k == "h":
+            self.toggle_hold(which)
+
+    def _handle_prompt(self, k):
+        kind = self.prompt[0]
+        if kind == "confirm":
+            _, _, fn = self.prompt
+            self.prompt = None
+            if k in ("y", "Y"):
+                fn()
+            else:
+                self.msg = "cancelled"
+            return
+        _, name, buf = self.prompt
+        if k == "esc" or k == "ctrl-c":
+            self.prompt = None
+            self.msg = "cancelled"
+        elif k == "backspace":
+            self.prompt = ("edit", name, buf[:-1])
+        elif k == "enter":
+            self.prompt = None
+            if not buf.strip():
+                self.msg = "cancelled"
+                return
+            try:
+                raw = parse_level(name, buf)
+            except ValueError as e:
+                self.msg = f"bad value: {e}"
+                return
+            self.pending.pop(name, None)
+            self.apply_level(name, raw)
+        elif len(k) == 1 and k.isprintable():
+            self.prompt = ("edit", name, buf + k)
+
+    # --- polling -------------------------------------------------------------------------
+    def poll(self):
+        try:
+            self.last = self.holder.poll()
+            self.err = None
+        except CommError as e:
+            self.holder.counts["comm"] += 1
+            self.holder.event(f"comm error: {e}")
+            self.hub.close()
+            self.err = str(e)
+        self.next_poll = time.monotonic() + self.a.interval
+
+    # --- drawing -------------------------------------------------------------------------
+    def lines(self, width, height):
+        s, h = self.last, self.holder
+        up = int(time.time() - h.started)
+        L = [f"{BOLD}SV241 Pro @ {self.hub.port or '?'}{RST}   {time.strftime('%Y-%m-%d %H:%M:%S')}   "
+             f"poll {self.a.interval:g} s   up {up // 3600:02d}:{up % 3600 // 60:02d}:{up % 60:02d}"]
+        if self.err:
+            L.append(f"{RED}!! {self.err}; retrying{RST}" + ("   (values below are stale)" if s else ""))
+        L.append("")
+        L.append(f"{DIM}  {'Output':<9}{'State':<7}  (switching not yet verified on hardware){RST}")
+        for i, n in enumerate(OUTPUTS):
+            st = "—" if not s else ("ON" if s["outs"][i] else "off")
+            L.append(("sel", i, f"  {n:<9}{st:<7}"))
+        L.append("")
+        L.append(f"{DIM}  {'Channel':<9}{'Device':>10}{'Raw':>6}  {'Hold':>10}   Status{RST}")
+        for name in CHANNELS:
+            dev = s["dev"][name] if s else None
+            cell = fmt_level(name, dev)
+            if name in self.pending:
+                p = self.pending[name][0]
+                cell = f"-> {fmt_level(name, p)}"
+                dev = p
+            raw = "" if dev is None else str(dev)
+            hold = fmt_level(name, h.targets[name]) if name in h.targets else "—"
+            status = h.status[name] if s else ""
+            if name == "pwm1" and dev is not None and dev > PWM1_SOFT_MAX:
+                status += f"{YEL}  >80 %: cycles at cutoff edge, 70-80 % suggested{RST}"
+            if name == "adj":
+                status += f"{DIM}  (volts approximate){RST}"
+            L.append(("sel", len(OUTPUTS) + list(CHANNELS).index(name),
+                      f"  {name.upper():<9}{cell:>10}{raw:>6}  {hold:>10}   ", status))
+        if s:
+            L.append("")
+            L.append(f"{DIM}  {'Sensor':<14}{'Now':>10}{'Min':>11}{'Max':>11}{'Avg':>11}{RST}")
+            for key, label, unit, spec in SENSOR_ROWS:
+                st = h.stats[key]
+                c = lambda v: (spec.format(v) + " " + unit) if v is not None else "n/a"
+                L.append(f"  {label:<14}{c(s[key]):>10}{c(st.min):>11}{c(st.max):>11}{c(st.avg):>11}")
+            L.append(f"  Energy {h.energy_wh:.2f} Wh since start")
+            lim, lens = s["pwm1_cutoff_c"], s["lens_c"]
+            if lim is not None and lens is not None:
+                m = lim - lens
+                L.append(f"  PWM1 cutoff {lim:.2f} °C: lens {abs(m):.2f} °C {'below' if m >= 0 else 'ABOVE'}"
+                         + (f"{RED}  -> firmware holds PWM1 at 0{RST}" if m < 0 else ""))
+            elif lens is None:
+                L.append("  Lens probe not connected: PWM1 cutoff cannot trigger")
+        # footer: message/prompt + key help, events fill whatever height is left
+        foot = ["", *(f"{DIM}{k}{RST}" for k in KEY_HELP)]   # prompt goes last: kept on tiny screens
+        if self.prompt and self.prompt[0] == "edit":
+            _, name, buf = self.prompt
+            unit = "volts" if name == "adj" else "percent"
+            foot.append(f"{BOLD}{name.upper()} new value ({unit}, or raw:N), Enter to send, Esc to cancel: {RST}{buf}_")
+        elif self.prompt:
+            foot.append(f"{BOLD}{YEL}{self.prompt[1]}{RST}")
+        else:
+            foot.append(self.msg)
+        room = height - len(L) - len(foot) - 2
+        if room > 0:
+            ev = list(h.events)[-room:]
+            L.append("")
+            L.append(f"{DIM}  Events{RST}")
+            L.extend("  " + e for e in ev)
+        L = L[:max(0, height - len(foot))] + foot   # short terminal: cut the body, never the prompt
+        return [self._fmt(x, width) for x in L][-height:] if height > 0 else []
+
+    def _fmt(self, x, width):
+        if isinstance(x, str):
+            return clip(x, width)
+        _, idx, text, *extra = x
+        tail = extra[0] if extra else ""
+        if idx == self.sel:
+            return clip(REV + ">" + text[1:] + RST + tail, width)    # same width rule as below
+        return clip(text + tail, width)
+
+    def render(self):
+        size = shutil.get_terminal_size((100, 40))
+        body = "".join("\033[K" + ln + RST + "\n" for ln in self.lines(size.columns, size.lines))
+        self.out.write("\033[H" + body.rstrip("\n") + "\033[J")
+        self.out.flush()
+
+    # --- main loop -----------------------------------------------------------------------
+    def run(self):
+        h = self.holder
+        if self.a.hold_current:
+            _, dev = self.hub.state()
+            for name in CHANNELS:
+                h.targets.setdefault(name, dev[name])
+        desc = ", ".join(f"{k.upper()}={fmt_level(k, v)}" for k, v in h.targets.items()) or "none"
+        h.event(f"TUI started; held: {desc}")
+        self.out.write("\033[?1049h\033[?25l\033[2J")      # alternate screen, hide cursor
+        last_draw = 0.0
+        old_sig = {}
+
+        def stop(*_):
+            raise KeyboardInterrupt
+        try:
+            for name in ("SIGTERM", "SIGHUP"):    # window closed / kill: still restore the tty
+                if hasattr(signal, name):
+                    try:
+                        old_sig[name] = signal.signal(getattr(signal, name), stop)
+                    except (ValueError, OSError):  # not the main thread
+                        pass
+            with self.keys:
+                while not self.quit:
+                    dirty = False
+                    if time.monotonic() >= self.next_poll:
+                        self.poll()
+                        dirty = True
+                    if self.pending:
+                        n = len(self.pending)
+                        self.flush_pending()
+                        dirty = dirty or len(self.pending) != n
+                    if dirty or time.monotonic() - last_draw >= 1.0:
+                        self.render()
+                        last_draw = time.monotonic()
+                    wait = min(0.1 if self.pending else 0.25, max(0.0, self.next_poll - time.monotonic()))
+                    for k in self.keys.read(wait):
+                        self.handle(k)
+                        dirty = True
+                        if self.quit:
+                            break
+                    if dirty and not self.quit:
+                        self.render()
+                        last_draw = time.monotonic()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                self.flush_pending(force=True)
+            except Exception:
+                pass
+            try:
+                self.out.write(RST + "\033[?25h\033[?1049l")
+                self.out.flush()
+            except OSError:                       # terminal already gone (SIGHUP)
+                pass
+            for name, old in old_sig.items():
+                if old is not None:
+                    try:
+                        signal.signal(getattr(signal, name), old)
+                    except (ValueError, OSError, TypeError):
+                        pass
+            if h.csv:
+                h.csv_f.close()
+
+
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+
+
+def visible_len(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def clip(s, width):
+    """Cut s to `width` visible characters, keeping escape codes intact."""
+    if width <= 0:
+        return ""
+    if visible_len(s) <= width:
+        return s
+    out, n, i = [], 0, 0
+    while i < len(s) and n < width:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        out.append(s[i])
+        n += 1
+        i += 1
+    return "".join(out) + RST
+
+
+def cmd_tui(hub, a):
+    if a.interval < 1:
+        print("error: --interval must be at least 1 s", file=sys.stderr)
+        return 2
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("error: tui needs an interactive console (cmd, PowerShell or Windows Terminal; "
+              "in Git Bash/mintty run it via 'winpty python sv241.py tui')", file=sys.stderr)
+        return 2
+    if os.name == "nt":
+        os.system("")   # enables ANSI escape handling in the Windows console
+    Tui(a, hub).run()
+    return 0
+
+
+# ------------------------------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------------------------------
 def build_parser():
@@ -715,6 +1199,15 @@ def build_parser():
     p.add_argument("--csv", help="append every poll to this CSV file")
     p.add_argument("--events", type=int, default=10, help="recent events shown (default 10)")
     p.add_argument("--no-clear", action="store_true", help="no refreshing display; print events only")
+    p = sub.add_parser("tui", help="interactive live display: switch outputs, change levels with keys")
+    p.add_argument("--adj", type=arg_level("adj"), help="hold ADJ OUT at this value from the start")
+    p.add_argument("--pwm1", type=arg_level("pwm1"), help="hold PWM1 at this value from the start")
+    p.add_argument("--pwm2", type=arg_level("pwm2"), help="hold PWM2 at this value from the start")
+    p.add_argument("--hold-current", action="store_true", help="start with all three channels held at current values")
+    p.add_argument("--interval", type=float, default=2.0, help="seconds between polls (default 2)")
+    p.add_argument("--csv", help="append every poll to this CSV file")
+    p.add_argument("--events", type=int, default=50, help="event history kept (default 50)")
+    p.set_defaults(no_clear=False)
     return ap
 
 
@@ -755,9 +1248,9 @@ def main(argv=None, hub_factory=None):
         return 2
     hub = (hub_factory or Hub)(a.port, a.timeout)
     handler = {"status": cmd_status, "sensors": cmd_sensors, "on": cmd_switch, "off": cmd_switch,
-               "set": cmd_set, "raw": cmd_raw, "hold": cmd_hold}[a.cmd]
+               "set": cmd_set, "raw": cmd_raw, "hold": cmd_hold, "tui": cmd_tui}[a.cmd]
     try:
-        if a.cmd == "hold":
+        if a.cmd in ("hold", "tui"):
             return handler(hub, a)               # hold manages (re)opening itself
         with hub:
             return handler(hub, a)
