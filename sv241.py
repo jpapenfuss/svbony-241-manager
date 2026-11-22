@@ -16,6 +16,15 @@ One-shot commands (open the port, do one thing, close it):
     python sv241.py set adj 12             # ADJ OUT to ~12 V (approximate scale, see below)
     python sv241.py raw 08                 # send cmd 0x08, print reply hex
     python sv241.py ports                  # list serial ports, CH340s flagged
+    python sv241.py cycle usba             # USB-A off 3 s, back on; report USB devices lost/regained
+    python sv241.py cycle dc2 usbc --off-time 5 --watch 20
+    python sv241.py off usba --usb-window 8   # watch host USB for 8 s after switching
+
+Host USB monitoring (no serial port needed, so it runs alongside NINA):
+
+    python sv241.py usb                    # USB device tree; SV241 hub, its CH340, devices behind it
+    python sv241.py usb --watch            # log connects/disconnects behind the SV241 hub
+    python sv241.py usb --watch --all      # ... of every USB device on the PC
 
 Hold mode (long-running monitor; the default when no command is given, so the old
 SVBONY-hold.py command lines still work unchanged):
@@ -26,6 +35,7 @@ SVBONY-hold.py command lines still work unchanged):
     python sv241.py                           # monitor only, enforce nothing
     python sv241.py --pwm1 40 --csv hub.csv   # also log every poll to CSV
     python sv241.py --pwm1 40 --no-clear      # plain scrolling event log (for services)
+    python sv241.py --pwm1 40 --usb-watch     # also log USB connects/disconnects behind the hub
 
 Interactive mode (live display; switch outputs and change levels with the keyboard):
 
@@ -42,11 +52,47 @@ Hold mode polls outputs, PWM/ADJ channels and sensors, shows them on a refreshin
 and re-pushes any target the hub no longer reports. Every push is read back to confirm it took.
 Ctrl+C exits and leaves settings as they are.
 
-Global options go before the command: --port COM6, --timeout 0.4.
+Global options go before the command (or anywhere in a hold command line): --port COM6,
+--timeout 0.4, --debug FILE, --usb-hub SPEC.
 
 One-shot exit codes: 0 success, 1 comm error, 2 hub did not take the value (e.g. PWM1 refused
 by the firmware dew cutoff) or bad argument (all arguments, including `raw` hex bytes, are
-checked before the port is opened). Settings persist on the hub (it saves them to flash).
+checked before the port is opened); `cycle` also 2 if an output could not be switched back on,
+3 (a USB device did not come back) and 130 (Ctrl+C during the off time; all outputs back on). Settings persist on the hub (it saves them to flash).
+
+Debug log (--debug FILE, any command)
+-------------------------------------
+Appends a JSONL trace, one JSON object per line, flushed per line ('-' = stderr, refused for tui).
+Every record has ts (local ISO 8601 time with ms and UTC offset), mono (monotonic seconds, for
+intervals) and ev (type). Types and their main fields:
+  start         argv, cmd, platform, python, pyserial version, pid       exit   rc or exception
+  port_open     port, auto, backend (pyserial/termios)                   port_close   port
+  xfer          tx, rx (hex), expect, got (short = timeout), ms          xfer_error   tx, error
+  state         outputs {DC1..USB-A: bool}, adj, pwm1, pwm2 (raw)        bad_reply    cmd, rx, attempt
+  sensors       raw {"03".."07": value/100, offsets in}, derived readings (input_v, lens_c, ...)
+  ack           idx, target, val, result (ok/refused/noack)              verify  target, want, got, ok
+  unsolicited   hex, text, banner (true = boot banner, hub rebooted)
+  comm_error / refused   where, error                                    event   msg (hold/TUI events)
+  key           key, row, prompt (TUI)                                   cycle   outputs, off_time, watch
+  usb_baseline  scope, count, devices    usb_add / usb_remove  dev, below_hub, mark, since_mark_s
+  usb_hub       hubs, bridge, note       usb_mark  label (a switch)      usb_list / usb_error
+Analyse with e.g. jq: jq -c 'select(.ev=="usb_remove")' trace.jsonl, or pandas.read_json(lines=True).
+
+Host USB monitoring
+-------------------
+See the "Host-side USB monitoring" section below for how the SV241's built-in hub is found (the
+CH340 bridge's parent hub, plus the SuperSpeed companion of a USB 3 hub) and the per-OS
+backends. Monitoring polls the OS device list and diffs it, so a timing is "seen by" the first
+poll after the OS (de)enumerated the device: one-shot windows poll every 0.2 s, `usb --watch`
+every 0.5 s, hold/TUI --usb-watch every --usb-interval (1 s). Where it is used:
+  on/off   watch for --usb-window s after switching (default 5 s when usbc/usba/all is switched)
+  cycle    off, --off-time s, on, --watch s; prints each change with its delay after the switch,
+           then a gone/back summary per device (all host USB devices, those behind the hub tagged)
+  usb      tree view, or --watch for a continuous log of devices behind the hub (--all: all)
+  hold/tui --usb-watch adds USB changes to the event list (and CSV/debug log); in the TUI they
+           are timed from the last output switch
+The hub identification is inferred from the OS device tree and NOT yet checked on the real box:
+run `sv241.py usb` once and confirm the marked hub is the SV241's (--usb-hub to override).
 
 Only one program can hold the serial port: close NINA's connection to the hub, the vendor app,
 or another running copy of this script first.
@@ -94,7 +140,8 @@ Protocol (firmware V1.3, disassembly-verified; full reference in docs/PROTOCOL.m
 
 Hardware status (2026-11-21, COM6): reads, PWM2 write/read-back, hold mode, base-255 decode,
 04 = lens / 05 = ambient and the PWM1 cutoff formula are confirmed. DC/USB output switching
-(on/off, all on/off) follows the firmware disassembly but is NOT yet tested on hardware.
+(on/off, all on/off, cycle) follows the firmware disassembly but is NOT yet tested on hardware.
+Host USB monitoring is tested against simulated device trees only (sysfs, CfgMgr32, ioreg).
 
 Known unknowns: the exact ADJ OUT volts-per-raw (vendor app's 15.3 V at raw 253 is used; the
 firmware only sets a 40 kHz PWM duty, so the real scale depends on the board's regulator), and
@@ -102,23 +149,29 @@ the scale of cmd 02 (INA219 power, unused here). Use raw:N when the ADJ voltage 
 
 Code layout (sections in file order)
 ------------------------------------
+  Debug log            DebugLog, DBG (the process-wide --debug JSONL writer)
   Protocol helpers     frame(), checksum_ok(), base255(), dew_point(), cutoff_limit()
   Port discovery       list_serial_ports(), pick_port(), PosixSerial (stdlib termios backend)
   Serial link          Hub: open/verify/close, xfer(), state()/sensors() reads, verified writes
+  Host USB monitoring  UsbDev, linux_usb_snapshot / parse_ioreg / _win_walk + win_build,
+                       find_sv241_hubs(), usb_subtree(), UsbWatcher, usb_cycle_report()
   Parsing/formatting   parse_level() (V / % / raw:N -> raw), fmt_level(), parse_outputs()
-  One-shot commands    cmd_status, cmd_sensors, cmd_switch, cmd_set, cmd_raw, cmd_ports
+  One-shot commands    cmd_status, cmd_sensors, cmd_switch, cmd_cycle, cmd_set, cmd_raw,
+                       cmd_ports, cmd_usb
   Hold mode            Stat, Holder (poll, enforce, cutoff tracking, CSV, render), cmd_hold
   TUI mode             Keys (raw key reader), Tui (keyboard actions on top of Holder), cmd_tui
-  CLI                  build_parser(), insert_default_command(), main()
+  CLI                  build_parser(), insert_default_command(), main() (debug log), _run()
 tests/fake_hub.py simulates the hub for tests/test_sv241.py (python -m unittest discover -s tests).
 
 Requires Python 3.8+. Windows needs pyserial (pip install pyserial); on macOS and Linux it is
 optional: without it a built-in termios backend is used and ports are found via /dev + sysfs.
+USB monitoring is stdlib too (ctypes CfgMgr32 on Windows, sysfs on Linux, ioreg on macOS).
 Not affiliated with SVBONY.
 """
 import argparse
 import collections
 import csv
+import datetime
 import errno
 import json
 import math
@@ -126,7 +179,9 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
+import threading
 import time
 
 # --- Hardware / protocol constants ---------------------------------------------------------
@@ -138,6 +193,7 @@ OUTPUTS = ["DC1", "DC2", "DC3", "DC4", "DC5", "USB-C", "USB-A"]
 OUT_ALIASES = {n.lower().replace("-", ""): i for i, n in enumerate(OUTPUTS)}   # dc1, usbc, ...
 OUT_ALIASES.update({str(i + 1): i for i in range(5)})          # "1".."5" -> DC1..DC5
 CHANNELS = {"adj": 7, "pwm1": 8, "pwm2": 9}                    # hub index for CMD 01
+INDEX_NAMES = {**dict(enumerate(OUTPUTS)), **{v: k for k, v in CHANNELS.items()}}   # idx -> name (debug log)
 # Levels are raw 0..255 (firmware LEDC duty = round(raw/255 * 1023)). The vendor app calls 253
 # "100 %" and "15.3 V"; those are app conventions, kept so values match what users see there.
 RAW_FULL = 253           # vendor app's 100 % / 15.3 V point
@@ -145,7 +201,8 @@ RAW_MAX = 255            # firmware accepts the full byte range
 ADJ_VMAX = 15.3          # assumed ADJ OUT volts at RAW_FULL (linear scale; unverified on hardware)
 INA_SCALE = 15.57        # vendor app's INA219 current correction (implies a non-default board shunt)
 PWR_OFFSET_MW = 269.39   # vendor app's fixed power offset (mW)
-COMMANDS = ("status", "sensors", "on", "off", "set", "raw", "ports", "hold", "tui")
+COMMANDS = ("status", "sensors", "on", "off", "set", "raw", "ports", "usb", "cycle", "hold", "tui")
+GLOBAL_OPTS = ("--port", "--timeout", "--debug", "--usb-hub")   # each takes one value
 
 
 class CommError(Exception):
@@ -154,6 +211,67 @@ class CommError(Exception):
 
 class Refused(Exception):
     """The hub answered but did not take a write (read-back mismatch or refusal ack). Exit code 2."""
+
+
+# ------------------------------------------------------------------------------------------
+# Debug log (--debug FILE)
+# ------------------------------------------------------------------------------------------
+class DebugLog:
+    """Structured, timestamped trace for offline analysis: one JSON object per line (JSONL).
+
+    Every record carries
+        ts    local wall-clock time, ISO 8601 with milliseconds and UTC offset
+        mono  time.monotonic() in seconds: use it for intervals (immune to clock changes)
+        ev    record type (listed under "Debug log" in the module header and the README)
+    plus fields specific to the type. Off by default: log() then returns at once, and the hot
+    path (Hub.xfer) checks `on` before formatting hex. Thread-safe (the USB watcher thread logs
+    too). Each line is flushed as it is written, so the file is complete even if the process is
+    killed. A write error (disk full, file closed) turns logging off with one warning on stderr
+    rather than breaking the command being traced."""
+
+    def __init__(self):
+        self.on = False
+        self.f = None
+        self.path = None
+        self._lock = threading.Lock()
+
+    def open(self, path):
+        """Start logging to `path` (appended to; "-" = stderr). Raises OSError if it can't open."""
+        self.f = sys.stderr if path == "-" else open(path, "a", encoding="utf-8")
+        self.path = path
+        self.on = True
+
+    def log(self, ev, **fields):
+        """Write one record {ts, mono, ev, **fields}; values json can't encode go through str()."""
+        if not self.on:
+            return
+        rec = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+               "mono": round(time.monotonic(), 4), "ev": ev}
+        rec.update(fields)
+        line = json.dumps(rec, ensure_ascii=False, default=str)
+        with self._lock:
+            if not self.on:                       # closed by another thread meanwhile
+                return
+            try:
+                self.f.write(line + "\n")
+                self.f.flush()
+            except (OSError, ValueError) as e:
+                self.on = False
+                print(f"warning: debug log {self.path} stopped: {e}", file=sys.stderr)
+
+    def close(self):
+        """Stop logging and close the file (never stderr). Safe to call repeatedly."""
+        with self._lock:
+            self.on = False
+            if self.f is not None and self.f is not sys.stderr:
+                try:
+                    self.f.close()
+                except OSError:
+                    pass
+            self.f = None
+
+
+DBG = DebugLog()   # process-wide; main() opens it for --debug, everything else just calls DBG.log
 
 
 # ------------------------------------------------------------------------------------------
@@ -501,9 +619,21 @@ class Hub:
     def open(self):
         """Open the port if not already open; returns self. Uses pyserial when installed, else
         PosixSerial (not on Windows). The serial-level timeout is short (0.05 s); xfer() applies
-        the overall reply timeout. After opening: 0.3 s settle, then check for a boot banner."""
+        the overall reply timeout. After opening: 0.3 s settle, then check for a boot banner.
+        Debug records: port_open on success, comm_error (where=open) on failure."""
         if self.ser:
             return self
+        try:
+            self._open()
+        except CommError as e:
+            DBG.log("comm_error", where="open", port=self.port, error=str(e))
+            raise
+        DBG.log("port_open", port=self.port, auto=self.port_arg is None,
+                backend="pyserial" if have_pyserial() else "termios")
+        return self
+
+    def _open(self):
+        """open() without the logging: pick the port, open it, settle, scan, verify a guess."""
         self.port = self.port_arg or self.find_port()
         if not have_pyserial():
             if os.name == "nt":
@@ -550,6 +680,7 @@ class Hub:
             except Exception:
                 pass
             self.ser = None
+            DBG.log("port_close", port=self.port)
 
     def __enter__(self):
         return self.open()
@@ -563,7 +694,11 @@ class Hub:
         An I/O error here closes the port and raises CommError (xfer passes it through)."""
         try:
             n = getattr(self.ser, "in_waiting", 0)
-            if n and b"SV241Pro" in self.ser.read(n):
+            data = self.ser.read(n) if n else b""
+            if data:
+                DBG.log("unsolicited", port=self.port, hex=data.hex(" "),
+                        text=data.decode("ascii", "replace"), banner=b"SV241Pro" in data)
+            if b"SV241Pro" in data:
                 self.reboot_seen = True
         except Exception as e:                    # port vanished between open and first read
             self.close()
@@ -573,8 +708,11 @@ class Hub:
         """Send frame tx, return up to `expect` reply bytes (fewer on timeout; caller validates).
 
         Half-duplex: input is flushed first so a late reply to an earlier request can't be taken
-        for this one. Any exception closes the port and becomes CommError."""
+        for this one. Any exception closes the port and becomes CommError.
+        Debug records: one `xfer` per exchange (tx/rx hex, expected and received length, elapsed
+        ms; a short rx means a timeout), or `xfer_error`."""
         self.open()
+        t0 = time.monotonic()
         try:
             self._scan_unsolicited()   # look for a boot banner before discarding the buffer
             self.ser.reset_input_buffer()
@@ -587,30 +725,40 @@ class Hub:
         except CommError:
             raise                                  # already worded (and port closed)
         except Exception as e:
+            DBG.log("xfer_error", port=self.port, tx=bytes(tx).hex(" "), error=str(e))
             self.close()
             raise CommError(f"serial I/O failed on {self.port}: {e}")
+        if DBG.on:
+            DBG.log("xfer", tx=bytes(tx).hex(" "), rx=bytes(buf).hex(" "), expect=expect, got=len(buf),
+                    ms=round((time.monotonic() - t0) * 1000, 1))
         return bytes(buf)
 
     # --- reads ---------------------------------------------------------------------------
     def state(self, tries=3):
         """CMD 08. Returns (outputs, levels): outputs = 7 bools in OUTPUTS order, levels =
         {"adj", "pwm1", "pwm2": raw 0..255}. Reply is 14 bytes: 24 0E 08 o0..o6 adj pwm1 pwm2 chk
-        (outputs reported 0/1 here, although CMD 01 sets them with 00/FF). Retries, then CommError."""
+        (outputs reported 0/1 here, although CMD 01 sets them with 00/FF). Retries, then CommError.
+        Debug records: `state` (decoded), `bad_reply` per rejected attempt."""
         r = b""
-        for _ in range(tries):
+        for attempt in range(1, tries + 1):
             r = self.xfer(frame(0x08), 14)
             if len(r) == 14 and r[0] == 0x24 and r[2] == 0x08 and checksum_ok(r):
-                return [v != 0 for v in r[3:10]], {"adj": r[10], "pwm1": r[11], "pwm2": r[12]}
+                outs, dev = [v != 0 for v in r[3:10]], {"adj": r[10], "pwm1": r[11], "pwm2": r[12]}
+                DBG.log("state", outputs=dict(zip(OUTPUTS, outs)), **dev)
+                return outs, dev
+            DBG.log("bad_reply", cmd=0x08, rx=r.hex(" "), attempt=attempt)
         raise CommError(f"bad state reply: {r.hex(' ') or 'nothing'}")
 
     def sensor(self, cmd, tries=2):
         """Read one sensor command (03..07). Reply is 8 bytes: 24 08 cmd b3 b4 b5 b6 chk.
         Returns the decoded value / 100, still including the +255 offset for 04/05/06, or None
-        after `tries` bad replies (a missing reading is not a comm error)."""
-        for _ in range(tries):
+        after `tries` bad replies (a missing reading is not a comm error; each is a `bad_reply`
+        debug record)."""
+        for attempt in range(1, tries + 1):
             r = self.xfer(frame(cmd), 8)
             if len(r) == 8 and r[0] == 0x24 and r[2] == cmd and checksum_ok(r):
                 return base255(r[3:7]) / 100.0
+            DBG.log("bad_reply", cmd=cmd, rx=r.hex(" "), attempt=attempt)
         return None
 
     def sensors(self):
@@ -625,7 +773,7 @@ class Hub:
         vin = self.sensor(0x03)
         ta = self.sensor(0x04)
         tb = self.sensor(0x05)
-        rh = self.sensor(0x06)
+        rh = rh_raw = self.sensor(0x06)
         cur = self.sensor(0x07)
         lens = ta - 255 if ta is not None else None
         if lens is not None and not -50 <= lens <= 90:
@@ -636,8 +784,11 @@ class Hub:
         pwr = ((INA_SCALE * vin * cur + PWR_OFFSET_MW) / 1000.0
                if vin is not None and cur is not None else None)
         dp = dew_point(amb, rh)
-        return dict(input_v=vin, current_a=cur_a, power_w=pwr, lens_c=lens, ambient_c=amb,
-                    humidity_pct=rh, dewpoint_c=dp, pwm1_cutoff_c=cutoff_limit(amb, rh))
+        out = dict(input_v=vin, current_a=cur_a, power_w=pwr, lens_c=lens, ambient_c=amb,
+                   humidity_pct=rh, dewpoint_c=dp, pwm1_cutoff_c=cutoff_limit(amb, rh))
+        # Debug: raw decoded values (/100, offsets still in) next to the derived readings
+        DBG.log("sensors", raw={"03": vin, "04": ta, "05": tb, "06": rh_raw, "07": cur}, **rounded(out))
+        return out
 
     # --- writes --------------------------------------------------------------------------
     def set_raw(self, idx, val):
@@ -649,8 +800,11 @@ class Hub:
         ack = self.xfer(frame(0x01, idx, val), 6)
         if (len(ack) == 6 and ack[0] == 0x24 and ack[1] == 0x06 and ack[2] == 0x01
                 and ack[3] == idx and checksum_ok(ack)):
-            return "ok" if ack[4] == 0xFF else "refused"
-        return "noack"
+            res = "ok" if ack[4] == 0xFF else "refused"
+        else:
+            res = "noack"
+        DBG.log("ack", idx=idx, target=INDEX_NAMES.get(idx, "?"), val=val, result=res)
+        return res
 
     def set_output(self, idx, on):
         """Switch output idx (0..6) on/off, verified via CMD 08; raises Refused on mismatch.
@@ -658,6 +812,7 @@ class Hub:
         ack = self.set_raw(idx, 0xFF if on else 0x00)
         time.sleep(0.05)
         outs, _ = self.state()
+        DBG.log("verify", target=OUTPUTS[idx], want=on, got=outs[idx], ok=outs[idx] == on, ack=ack)
         if outs[idx] != on:
             raise Refused(f"{OUTPUTS[idx]} still {'on' if outs[idx] else 'off'} (ack {ack})")
 
@@ -669,6 +824,7 @@ class Hub:
         time.sleep(0.1)
         outs, _ = self.state()
         bad = [OUTPUTS[i] for i, v in enumerate(outs) if v != on]
+        DBG.log("verify", target="all", want=on, ok=not bad, mismatched=bad)
         if bad:
             raise Refused(f"still {'off' if on else 'on'}: {', '.join(bad)}")
 
@@ -678,9 +834,591 @@ class Hub:
         ack = self.set_raw(CHANNELS[name], raw)
         time.sleep(0.05)
         _, dev = self.state()
+        DBG.log("verify", target=name, want=raw, got=dev[name], ok=dev[name] == raw, ack=ack)
         if dev[name] != raw:
             why = " (PWM1 dew cutoff: lens probe above limit)" if name == "pwm1" and ack == "refused" else ""
             raise Refused(f"{name.upper()} reads raw {dev[name]}, wanted {raw} (ack {ack}){why}")
+
+
+# ------------------------------------------------------------------------------------------
+# Host-side USB monitoring (what the PC sees appear / disappear on its USB bus)
+# ------------------------------------------------------------------------------------------
+# The SV241 Pro reaches the PC through one upstream USB cable into its built-in USB hub. Its
+# CH340 serial bridge (the control port) is assumed to sit on that hub too, so the hub is found
+# as the CH340's parent; devices plugged into the box's USB ports are the hub's other children.
+# A USB 3 hub shows up as two hubs (a USB 2 half and a SuperSpeed half), so a "companion" hub is
+# looked for as well. All of this is inferred from the OS device tree, not from the protocol,
+# and is not yet confirmed on the real hub: `python sv241.py usb` prints what was identified so
+# it can be checked, and --usb-hub overrides it.
+#
+# Each backend returns a snapshot {key: UsbDev} of the USB devices present right now; changes
+# are found by diffing snapshots taken by polling (no OS event subscription: stdlib only).
+#   Linux    /sys/bus/usb/devices (key = sysfs name such as 1-2.3; USB3 companion from the
+#            port's `peer` link)
+#   Windows  CfgMgr32 device tree via ctypes (key = device instance ID; companion from the
+#            shared container ID)
+#   macOS    `ioreg -p IOUSB -l -w0` (key = locationID; companion by heuristic only)
+# Poll-based timing: a change is seen at the first poll after the OS finished (de)enumerating it,
+# so timings are upper bounds with the poll interval as resolution.
+
+UsbDev = collections.namedtuple("UsbDev", "key parent vid pid name serial ports root peer container")
+UsbDev.__new__.__defaults__ = ((), False, "", "")   # ports, root, peer, container
+UsbDev.__doc__ = """One USB device in a snapshot.
+key       backend-specific stable id (see above); parent: key of the device it hangs off, or None
+vid, pid  USB ids (None for root hubs on Windows)
+name      product / friendly name; serial: iSerial ("" if none)
+ports     serial port names served by this device (e.g. ("COM6",) or ("/dev/ttyUSB0",))
+root      True for a host controller's root hub
+peer      Linux: key of the device on the companion (USB2 <-> USB3) port, if any
+container Windows: container ID (both halves of a USB3 hub share one)"""
+
+WIN_NULL_CONTAINER = "{00000000-0000-0000-ffff-ffffffffffff}"   # "no container"/the PC itself
+USB_WINDOW_S = 5.0          # default watch time after on/off of a USB output (one-shot commands)
+
+
+class UsbUnavailable(Exception):
+    """This OS's USB enumeration failed or is not supported (monitoring is skipped, not fatal)."""
+
+
+def _read_text(path):
+    """Contents of a small text file, stripped; "" if it can't be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _linux_port_of(name):
+    """sysfs USB device name -> (hub interface dir, port dir name) of the port it is plugged into.
+    1-2 -> ("1-0:1.0", "usb1-port2"); 1-2.3 -> ("1-2:1.0", "1-2-port3")."""
+    bus, path = name.split("-", 1)
+    if "." in path:
+        hub, n = name.rsplit(".", 1)
+        return f"{hub}:1.0", f"{hub}-port{n}"
+    return f"{bus}-0:1.0", f"usb{bus}-port{path}"
+
+
+def _linux_dev_at_port(port_dir):
+    """Inverse of _linux_port_of for a port dir name: usb2-port2 -> 2-2, 2-2-port3 -> 2-2.3."""
+    m = re.fullmatch(r"usb(\d+)-port(\d+)", port_dir)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    m = re.fullmatch(r"(\d+-[\d.]+)-port(\d+)", port_dir)
+    return f"{m.group(1)}.{m.group(2)}" if m else ""
+
+
+def linux_usb_snapshot(root="/sys/bus/usb/devices"):
+    """{key: UsbDev} from sysfs. Only device nodes (names without ':'; interfaces skipped).
+    Parent: 1-2.3 -> 1-2, 1-2 -> usb1 (the root hub). ports: tty nodes under the device's
+    interfaces (ttyUSB* for CH340/FTDI, tty/ttyACM* for CDC-ACM). peer: the device on the
+    companion port named by <hub iface>/<port>/peer (kernel 3.x+, needs ACPI/hub support; "" when
+    absent). `root` is a parameter so tests can point it at a fake tree."""
+    import glob
+    try:
+        names = os.listdir(root)
+    except OSError as e:
+        raise UsbUnavailable(f"can't read {root}: {e}")
+    out = {}
+    for name in names:
+        if ":" in name:
+            continue
+        p = os.path.join(root, name)
+        try:
+            vid, pid = int(_read_text(os.path.join(p, "idVendor")), 16), int(_read_text(os.path.join(p, "idProduct")), 16)
+        except ValueError:
+            continue                              # not a USB device node
+        is_root = name.startswith("usb")
+        parent, peer = None, ""
+        if not is_root:
+            parent = name.rsplit(".", 1)[0] if "." in name else "usb" + name.split("-", 1)[0]
+            hub_if, port = _linux_port_of(name)
+            link = os.path.join(root, hub_if, port, "peer")
+            if os.path.lexists(link):
+                peer = _linux_dev_at_port(os.path.basename(os.path.realpath(link)))
+        ttys = glob.glob(os.path.join(p, name + ":*", "tty*")) + glob.glob(os.path.join(p, name + ":*", "tty", "tty*"))
+        ports = tuple(sorted({"/dev/" + os.path.basename(t) for t in ttys
+                              if re.fullmatch(r"tty[A-Za-z]+\d+", os.path.basename(t))}))
+        label = " ".join(x for x in (_read_text(os.path.join(p, "manufacturer")),
+                                     _read_text(os.path.join(p, "product"))) if x)
+        out[name] = UsbDev(name, parent, vid, pid, label or "USB device", _read_text(os.path.join(p, "serial")),
+                           ports, is_root, peer)
+    return out
+
+
+def parse_ioreg(text):
+    """{key: UsbDev} from `ioreg -p IOUSB -l -w0` output.
+
+    Tree lines look like "  | +-o USB2.0 Hub@00100000  <class IOUSBHostDevice, ...>"; the column
+    of "+-o" gives the depth. Property lines inside { } look like '"idVendor" = 6790'. Only nodes
+    with idVendor are devices; a device's parent is its nearest such ancestor (controllers have no
+    idVendor, so devices on a root port get parent None). Key = locationID as 0x%08x (it encodes
+    the port path, so it is stable across re-plugs), else the node name."""
+    nodes, stack = [], []          # stack: [(depth, node)] of the current ancestry
+    cur = None
+    for line in text.splitlines():
+        m = re.match(r"^([ |]*)\+-o (.+?)  <class ([^,>]+)", line)
+        if m:
+            depth = len(m.group(1)) // 2
+            while stack and stack[-1][0] >= depth:
+                stack.pop()
+            cur = {"name": m.group(2), "cls": m.group(3), "props": {},
+                   "anc": [n for _, n in stack]}
+            stack.append((depth, cur))
+            nodes.append(cur)
+            continue
+        m = re.match(r'^[ |]*"([^"]+)" = (.*)$', line)
+        if m and cur is not None:
+            cur["props"][m.group(1)] = m.group(2).strip()
+
+    def num(v):
+        try:
+            return int(v, 0)
+        except (TypeError, ValueError):
+            return None
+
+    def text_prop(n, *names):
+        for k in names:
+            v = n["props"].get(k)
+            if v:
+                return v.strip('"')
+        return ""
+
+    def key(n):
+        loc = num(n["props"].get("locationID"))
+        return f"0x{loc:08x}" if loc is not None else n["name"]
+
+    out = {}
+    for n in nodes:
+        vid = num(n["props"].get("idVendor"))
+        if vid is None:
+            continue
+        par = next((a for a in reversed(n["anc"]) if num(a["props"].get("idVendor")) is not None), None)
+        name = text_prop(n, "USB Product Name", "kUSBProductString") or n["name"].split("@")[0]
+        root = "Root Hub" in n["name"] or "RootHub" in n["cls"]
+        out[key(n)] = UsbDev(key(n), key(par) if par else None, vid, num(n["props"].get("idProduct")), name,
+                             text_prop(n, "USB Serial Number", "kUSBSerialNumberString"), (), root)
+    return out
+
+
+def mac_usb_snapshot():
+    """Run ioreg and parse it (parse_ioreg). Serial port names are not mapped on macOS."""
+    try:
+        r = subprocess.run(["ioreg", "-p", "IOUSB", "-l", "-w0"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise UsbUnavailable(f"ioreg failed: {e}")
+    if r.returncode != 0:
+        raise UsbUnavailable(f"ioreg exited {r.returncode}: {r.stderr.strip()[:200]}")
+    return parse_ioreg(r.stdout)
+
+
+_CM = None   # cfgmgr32 handle with prototypes set (Windows), created on first use
+
+
+def _win_walk():
+    """Yield (instance_id, parent_instance_id, friendly_name, device_desc, container_id) for every
+    devnode at or below a USB node in the live Windows device tree (CfgMgr32 via ctypes).
+
+    The tree is walked from the root with CM_Get_Child / CM_Get_Sibling; it only holds devices
+    that are present, so a snapshot is exactly "what is connected now". Every devnode is visited,
+    but properties are read (and tuples yielded) only for USB nodes (instance IDs starting USB\\)
+    and everything below them (HID\\, FTDIBUS\\, ... function nodes, whose friendly names carry
+    COM port numbers). CM_DRP_BASE_CONTAINERID is documented as a REG_SZ "{guid}" string; if it
+    came back otherwise, container grouping would quietly fall back to the heuristic.
+    Registry codes: CM_DRP_DEVICEDESC 0x01, CM_DRP_FRIENDLYNAME 0x0D, CM_DRP_BASE_CONTAINERID 0x25."""
+    global _CM
+    import ctypes
+    from ctypes import wintypes
+    DI, UL = wintypes.DWORD, wintypes.ULONG
+    if _CM is None:
+        cm = ctypes.WinDLL("cfgmgr32")
+        cm.CM_Locate_DevNodeW.argtypes = [ctypes.POINTER(DI), wintypes.LPCWSTR, UL]
+        cm.CM_Get_Child.argtypes = [ctypes.POINTER(DI), DI, UL]
+        cm.CM_Get_Sibling.argtypes = [ctypes.POINTER(DI), DI, UL]
+        cm.CM_Get_Device_IDW.argtypes = [DI, wintypes.LPWSTR, UL, UL]
+        cm.CM_Get_DevNode_Registry_PropertyW.argtypes = [DI, UL, ctypes.POINTER(UL), ctypes.c_void_p,
+                                                         ctypes.POINTER(UL), UL]
+        for f in (cm.CM_Locate_DevNodeW, cm.CM_Get_Child, cm.CM_Get_Sibling, cm.CM_Get_Device_IDW,
+                  cm.CM_Get_DevNode_Registry_PropertyW):
+            f.restype = UL                        # CONFIGRET; 0 = CR_SUCCESS
+        _CM = cm
+    cm = _CM
+    root = DI()
+    if cm.CM_Locate_DevNodeW(ctypes.byref(root), None, 0) != 0:
+        raise UsbUnavailable("CM_Locate_DevNodeW failed")
+    idbuf = ctypes.create_unicode_buffer(512)      # MAX_DEVICE_ID_LEN is 200
+    pbuf = ctypes.create_unicode_buffer(1024)
+
+    def dev_id(dn):
+        return idbuf.value if cm.CM_Get_Device_IDW(dn, idbuf, len(idbuf), 0) == 0 else None
+
+    def prop(dn, code):
+        size, typ = UL(ctypes.sizeof(pbuf)), UL()
+        if cm.CM_Get_DevNode_Registry_PropertyW(dn, code, ctypes.byref(typ), pbuf, ctypes.byref(size), 0) != 0:
+            return ""
+        return pbuf.value
+
+    stack, child = [(root.value, None, False)], DI()
+    while stack:
+        dn, parent_id, under_usb = stack.pop()
+        iid = dev_id(dn)
+        if iid is None:                           # vanished mid-walk
+            continue
+        usb = under_usb or iid.upper().startswith("USB\\")
+        if usb:
+            yield iid, parent_id, prop(dn, 0x0D), prop(dn, 0x01), prop(dn, 0x25)
+        if cm.CM_Get_Child(ctypes.byref(child), dn, 0) == 0:
+            c = child.value
+            while True:
+                stack.append((c, iid, usb))
+                if cm.CM_Get_Sibling(ctypes.byref(child), c, 0) != 0:
+                    break
+                c = child.value
+
+
+def win_build(nodes):
+    """{key: UsbDev} from _win_walk() tuples. Kept separate from the ctypes walk so it can be
+    tested anywhere.
+
+    Only USB *device* nodes are kept: instance IDs USB\\VID_xxxx&PID_yyyy\\<serial or port id>
+    and USB\\ROOT_HUB*; interface nodes (&MI_xx) and function nodes below them (HID\\, FTDIBUS\\,
+    ...) are folded into the nearest device above, contributing any "(COMn)" in their names to its
+    `ports`. A device description in raw INF form ("@usb.inf,%id%;Name") is cut to Name. Parent = nearest USB device ancestor. Serial = last ID segment unless it contains '&'
+    (Windows generates such IDs for devices without a serial number)."""
+    nodes = list(nodes)
+    info = {n[0]: n for n in nodes}
+
+    def is_dev(iid):
+        u = iid.upper()
+        return u.startswith("USB\\") and "&MI_" not in u
+
+    def owner(iid):
+        seen = 0
+        while iid is not None and iid in info and seen < 64:
+            if is_dev(iid):
+                return iid
+            iid, seen = info[iid][1], seen + 1
+        return None
+
+    ports = collections.defaultdict(set)
+    for iid, _par, friendly, _desc, _cont in nodes:
+        o = owner(iid)
+        for m in re.finditer(r"\((COM\d+)\)", friendly or ""):
+            if o:
+                ports[o].add(m.group(1))
+    out = {}
+    for iid, par, friendly, desc, cont in nodes:
+        if not is_dev(iid):
+            continue
+        if desc.startswith("@") and ";" in desc:   # raw INF reference "@usb.inf,%id%;Generic USB Hub"
+            desc = desc.rsplit(";", 1)[-1]
+        m = re.search(r"VID_([0-9A-F]{4})&PID_([0-9A-F]{4})", iid, re.I)
+        tail = iid.split("\\")[-1]
+        out[iid] = UsbDev(iid, owner(par), int(m.group(1), 16) if m else None, int(m.group(2), 16) if m else None,
+                          friendly or desc or iid, tail if "&" not in tail else "", tuple(sorted(ports[iid])),
+                          "ROOT_HUB" in iid.upper(), "", (cont or "").lower())
+    return out
+
+
+def usb_snapshot():
+    """{key: UsbDev} of every USB device the host sees now; raises UsbUnavailable."""
+    if sys.platform.startswith("linux"):
+        return linux_usb_snapshot()
+    if sys.platform == "darwin":
+        return mac_usb_snapshot()
+    if os.name == "nt":
+        try:
+            return win_build(_win_walk())
+        except UsbUnavailable:
+            raise
+        except Exception as e:                     # cfgmgr32 missing, ctypes error, ...: never fatal
+            raise UsbUnavailable(f"CfgMgr32 enumeration failed: {e!r}")
+    raise UsbUnavailable(f"no USB enumeration backend for {sys.platform}")
+
+
+def usb_subtree(snap, roots):
+    """Keys of devices at or below any key in roots (the roots themselves included)."""
+    roots, out = set(roots), set()
+    for k in snap:
+        c, seen = k, 0
+        while c is not None and seen < 64:
+            if c in roots:
+                out.add(k)
+                break
+            d = snap.get(c)
+            c, seen = (d.parent if d else None), seen + 1
+    return out
+
+
+def _is_hub(snap, d):
+    """Heuristic: named like a hub, or has children in the snapshot."""
+    return "hub" in d.name.lower() or any(x.parent == d.key for x in snap.values())
+
+
+def usb_companions(snap, hub):
+    """Keys of the other half of a USB3 hub (see section comment), most reliable source first:
+    Linux port peer link; Windows shared container ID (ignoring the null container); else any
+    other hub with the same VID on the same parent, or with both on root hubs (two halves sit on
+    different root hubs on Linux/macOS). The heuristic can pick a second identical hub plugged
+    in next to the SV241; --usb-hub overrides."""
+    if hub.peer:
+        return [hub.peer] if hub.peer in snap else []
+    if hub.container and hub.container != WIN_NULL_CONTAINER:
+        same = [d.key for d in snap.values() if d.key != hub.key and d.container == hub.container
+                and _is_hub(snap, d) and d.parent not in usb_subtree(snap, [hub.key])]
+        if same:
+            return same
+
+    def on_root(d):
+        p = snap.get(d.parent)
+        return d.parent is None or (p is not None and p.root)
+    return [d.key for d in snap.values()
+            if d.key != hub.key and not d.root and d.vid == hub.vid and _is_hub(snap, d)
+            and (d.parent == hub.parent or (on_root(d) and on_root(hub)))
+            and hub.key not in usb_subtree(snap, [d.key]) and d.key not in usb_subtree(snap, [hub.key])]
+
+
+def _same_port(a, b):
+    """Serial port names equal, ignoring case and any /dev/ prefix (COM6 == com6)."""
+    return os.path.basename(str(a)).lower() == os.path.basename(str(b)).lower()
+
+
+def find_sv241_hubs(snap, port=None, spec=None):
+    """Identify the SV241's USB hub(s) in a snapshot. Returns (hub keys, bridge key, note).
+
+    spec (--usb-hub): comma-separated keys or VID:PID (hex) values, taken as the hub list as-is
+    (bridge None). Otherwise: the CH340 bridge serving `port` (or the only CH340, or the first of
+    several, with a note), then its parent hub plus usb_companions(). If the CH340's parent is a
+    host root hub, the SV241 hub can't be told from the PC's own ports, so none is returned and
+    the note says so. hub keys = [] with a note when nothing fits."""
+    if spec:
+        keys, missing = [], []
+        for item in (x.strip() for x in spec.split(",") if x.strip()):
+            m = re.fullmatch(r"([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})", item)
+            hits = ([d.key for d in snap.values() if (d.vid, d.pid) == (int(m.group(1), 16), int(m.group(2), 16))]
+                    if m else [k for k in snap if k.lower() == item.lower()])
+            keys += [k for k in hits if k not in keys]
+            if not hits:
+                missing.append(item)
+        return keys, None, (f"--usb-hub {', '.join(missing)} not present" if missing else None)
+    ch = [d for d in snap.values() if (d.vid, d.pid) == CH340]
+    if not ch:
+        return [], None, "no CH340 (1A86:7523) on the USB bus: SV241 not connected?"
+    note = None
+    if port:
+        mine = [d for d in ch if any(_same_port(port, p) for p in d.ports)]
+        ch = mine or ch
+    if len(ch) > 1:
+        ch.sort(key=lambda d: d.key)
+        note = f"{len(ch)} CH340 bridges and none matched the port; using {ch[0].key} (pass --port or --usb-hub)"
+    bridge = ch[0]
+    hub = snap.get(bridge.parent)
+    if hub is None and bridge.parent is not None:
+        return [], bridge.key, (f"the parent {bridge.parent} of CH340 {bridge.key} is missing from the "
+                                "device list (still enumerating?)")
+    if hub is None or hub.root:
+        return [], bridge.key, (f"CH340 {bridge.key} is on a host root port, so the SV241 hub could "
+                                "not be identified; pass --usb-hub")
+    return [hub.key] + [k for k in usb_companions(snap, hub) if k != hub.key], bridge.key, note
+
+
+def usb_label(d):
+    """One-line description: VID:PID name (ports) serial [key]."""
+    ids = f"{d.vid:04X}:{d.pid:04X}" if d.vid is not None and d.pid is not None else "----:----"
+    ports = [p for p in d.ports if p not in d.name]
+    return (f"{ids} {d.name}" + (f" ({', '.join(ports)})" if ports else "")
+            + (f" s/n {d.serial}" if d.serial else "") + f" [{d.key}]")
+
+
+def usb_record(d):
+    """UsbDev -> plain dict for the debug log (ids as hex text)."""
+    r = d._asdict()
+    r["vid"] = f"{d.vid:04x}" if d.vid is not None else None
+    r["pid"] = f"{d.pid:04x}" if d.pid is not None else None
+    r["ports"] = list(d.ports)
+    return r
+
+
+class UsbWatcher:
+    """Poll the host's USB devices and report what appears and disappears.
+
+    scope "hub": only devices at or below the SV241 hub(s) (find_sv241_hubs, re-resolved
+    whenever a hub is missing, so unplugging and re-plugging the whole box is followed);
+    scope "all": every USB device on the host, with devices below the SV241 hub tagged.
+
+    sink(line) gets one human-readable line per change; every change is also a debug record
+    (usb_add / usb_remove; usb_baseline, usb_hub, usb_mark, usb_error). mark(label) records a
+    switching action: changes within MARK_WINDOW_S of it say "+x.xx s after <label>", and
+    `history` keeps the last 5000 (monotonic time, "+"/"-", UsbDev, below_hub) for cycle reports.
+
+    poll() can be called directly (one-shot windows) or from start()'s background thread
+    (hold/TUI/usb --watch). `port` is a port name or a callable returning one (the Hub's port is
+    only known once it has opened). `snapshot` defaults to usb_snapshot, looked up at call time."""
+
+    MARK_WINDOW_S = 60.0
+
+    def __init__(self, scope="hub", port=None, hub_spec=None, sink=None, snapshot=None):
+        self.scope, self._port, self.hub_spec = scope, port, hub_spec
+        self.sink = sink or (lambda line: None)
+        self._snapshot = snapshot
+        self.hubs, self.bridge = [], None
+        self.prev = None                  # in-scope devices at the last poll
+        self.prev_below = set()           # keys below the SV241 hub at the last poll
+        self.mark_label, self.mark_t = None, None
+        self.history = collections.deque(maxlen=5000)   # bounded: hold/TUI watch for hours
+        self.available = True
+        self._said = None                 # last hub/unavailable note, so it is said once
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    @property
+    def port(self):
+        return self._port() if callable(self._port) else self._port
+
+    def _say(self, line, once=False):
+        """Send a line to the sink; once=True suppresses an immediate repeat of the same line."""
+        if once and line == self._said:
+            return
+        if once:
+            self._said = line
+        self.sink(line)
+
+    def mark(self, label):
+        """Note that `label` (e.g. "USB-A off") happens now; later changes are timed from it."""
+        with self._lock:
+            self.mark_label, self.mark_t = label, time.monotonic()
+        DBG.log("usb_mark", label=label)
+
+    def _resolve(self, snap):
+        hubs, bridge, note = find_sv241_hubs(snap, self.port, self.hub_spec)
+        if hubs and hubs != self.hubs:
+            self._say("SV241 USB hub: " + "; ".join(usb_label(snap[h]) for h in hubs), once=True)
+            DBG.log("usb_hub", hubs=[usb_record(snap[h]) for h in hubs], bridge=bridge, note=note)
+        elif not hubs and self.hubs:
+            self._say("SV241 USB hub is gone from the bus", once=True)
+            DBG.log("usb_hub", hubs=[], bridge=bridge, note="hub gone")
+        if note:
+            self._say(f"note: {note}", once=True)
+        self.hubs, self.bridge = hubs, bridge
+
+    def poll(self):
+        """Take one snapshot and report changes since the previous one. The first successful call
+        only records the baseline. Returns [(kind, UsbDev)] with kind "+" (appeared) / "-" (gone)."""
+        snap_fn = self._snapshot or usb_snapshot
+        try:
+            snap = snap_fn()
+        except UsbUnavailable as e:
+            line = f"USB monitoring unavailable: {e}"
+            if line != self._said:
+                DBG.log("usb_error", error=str(e))
+            self._say(line, once=True)
+            self.available = False
+            return []
+        self.available = True
+        now = time.monotonic()
+        with self._lock:
+            if self.hub_spec or not self.hubs or any(h not in snap for h in self.hubs):
+                self._resolve(snap)
+            below = usb_subtree(snap, self.hubs) if self.hubs else set()
+            cur = {k: snap[k] for k in (snap if self.scope == "all" else below)}
+            if self.prev is None:
+                self.prev, self.prev_below = cur, below
+                DBG.log("usb_baseline", scope=self.scope, count=len(cur),
+                        devices=[dict(usb_record(d), below_hub=d.key in below) for d in cur.values()])
+                return []
+            changes = ([("-", self.prev[k]) for k in sorted(self.prev) if k not in cur]
+                       + [("+", cur[k]) for k in sorted(cur) if k not in self.prev])
+            prev_below = self.prev_below
+            self.prev, self.prev_below = cur, below
+            label, t_mark = self.mark_label, self.mark_t
+        for kind, d in changes:
+            under = d.key in (prev_below if kind == "-" else below)
+            since = now - t_mark if t_mark is not None and now - t_mark <= self.MARK_WINDOW_S else None
+            self.history.append((now, kind, d, under))
+            DBG.log("usb_remove" if kind == "-" else "usb_add", dev=usb_record(d), below_hub=under,
+                    mark=label if since is not None else None,
+                    since_mark_s=round(since, 3) if since is not None else None)
+            self._say(f"USB {'connected   ' if kind == '+' else 'DISCONNECTED'} {usb_label(d)}"
+                      + (" (behind SV241 hub)" if under and self.scope == "all" else "")
+                      + (f"  +{since:.2f} s after {label}" if since is not None else ""))
+        return changes
+
+    def watch_for(self, seconds, step=0.2):
+        """Poll every `step` s for `seconds` (foreground; one-shot commands)."""
+        end = time.monotonic() + seconds
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(step, left))
+            self.poll()
+
+    def count(self):
+        """Devices currently in scope (None before the first successful poll)."""
+        return None if self.prev is None else len(self.prev)
+
+    def start(self, interval=1.0):
+        """Take the baseline now, then poll every `interval` s in a daemon thread until stop().
+        Unexpected exceptions in the thread are logged (usb_error) and polling continues."""
+        self.poll()
+
+        def run():
+            while not self._stop.wait(interval):
+                try:
+                    self.poll()
+                except Exception as e:            # never let the watcher kill the main program
+                    DBG.log("usb_error", error=repr(e))
+                    self._say(f"USB watcher error: {e!r}", once=True)
+        self._thread = threading.Thread(target=run, name="usb-watch", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        """Stop the background thread (if any) and wait briefly for it."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+
+def usb_cycle_report(w, t_off, t_on, watched):
+    """Summarise a cycle from w.history: for each device, when it disappeared after the off
+    switch (t_off, monotonic) and when it came back after the on switch (t_on); devices that did
+    not come back within `watched` s; devices that are new. Returns (lines, n_not_back)."""
+    gone, back, new = {}, {}, []
+    for t, kind, d, under in w.history:
+        if t < t_off:
+            continue
+        if kind == "-" and d.key not in gone:
+            gone[d.key] = (t, d, under)
+        elif kind == "+":
+            if d.key in gone and d.key not in back:
+                back[d.key] = t
+            elif d.key not in gone:
+                new.append((t, d, under))
+    lines, missing = [], 0
+    for k, (t, d, under) in sorted(gone.items(), key=lambda x: x[1][0]):
+        tag = " (behind SV241 hub)" if under else ""
+        if k in back and back[k] < t_on:
+            lines.append(f"  gone +{t - t_off:.2f} s after off, back +{back[k] - t_off:.2f} s after off "
+                         f"(before the on switch): {usb_label(d)}{tag}")
+        elif k in back:
+            lines.append(f"  gone +{t - t_off:.2f} s after off, back +{back[k] - t_on:.2f} s after on: {usb_label(d)}{tag}")
+        else:
+            missing += 1
+            lines.append(f"  gone +{t - t_off:.2f} s after off, NOT back within {watched:g} s: {usb_label(d)}{tag}")
+    for t, d, under in new:
+        lines.append(f"  new  +{t - t_on:.2f} s after on (not seen before): {usb_label(d)}"
+                     + (" (behind SV241 hub)" if under else ""))
+    if not lines:
+        lines.append("  no USB devices disappeared or appeared")
+    return lines, missing
+
+
+def ts_print(line):
+    """Print a line prefixed with HH:MM:SS.mmm (USB watcher sink for one-shot commands)."""
+    now = datetime.datetime.now()
+    print(f"{now:%H:%M:%S}.{now.microsecond // 1000:03d} {line}", flush=True)
 
 
 # ------------------------------------------------------------------------------------------
@@ -755,9 +1493,9 @@ def rounded(d):
 # ------------------------------------------------------------------------------------------
 # One-shot commands
 # ------------------------------------------------------------------------------------------
-# Each cmd_* handler takes (hub, args) (cmd_ports: args only, no hub) and returns the process
-# exit code; main() maps
-# CommError -> 1 and Refused -> 2 for anything they let escape.
+# Each cmd_* handler takes (hub, args) (cmd_ports and cmd_usb: args only, no hub) and returns
+# the process exit code; _run() maps CommError -> 1 and Refused -> 2 (UsbUnavailable -> 1 for
+# cmd_usb) for anything they let escape.
 def print_sensors(s):
     """Human-readable sensors() dict, including the PWM1 cutoff margin when computable."""
     print(f"  Input voltage  {show(s['input_v'], 'V')}")
@@ -805,23 +1543,227 @@ def cmd_sensors(hub, a):
     return 0
 
 
+USB_OUTPUTS = (5, 6)        # USB-C, USB-A: the outputs whose switching is expected to move USB devices
+
+
+def switch_targets(tokens):
+    """on/off/cycle output arguments -> sorted indexes; a lone "all" means all 7."""
+    return list(range(len(OUTPUTS))) if [t.lower() for t in tokens] == ["all"] else parse_outputs(tokens)
+
+
+def usb_window_watcher(hub, a, idxs):
+    """UsbWatcher (scope "all", baseline taken, printing timestamped lines) for watching USB
+    changes around an on/off, or None. Window: --usb-window if given, else USB_WINDOW_S when a USB
+    output is among idxs (DC outputs can power USB devices too, but usually don't), else 0."""
+    win = a.usb_window if a.usb_window is not None else (USB_WINDOW_S if set(idxs) & set(USB_OUTPUTS) else 0)
+    if win <= 0:
+        return None, 0
+    w = UsbWatcher("all", port=lambda: hub.port or a.port, hub_spec=a.usb_hub, sink=ts_print)
+    w.poll()
+    return (w if w.available else None), win
+
+
 def cmd_switch(hub, a):
     """on/off <outputs...|all>. Each output is switched and verified separately; failures are
-    reported and the rest still attempted (rc 2 if any failed). Untested on hardware."""
+    reported and the rest still attempted (rc 2 if any failed). "all" uses the firmware all-on/off
+    command. With a USB watch window (see usb_window_watcher), host USB connects/disconnects are
+    printed with their delay after the switch, then summarised. Untested on hardware."""
     on = a.cmd == "on"
+    idxs = switch_targets(a.outputs)
+    w, win = usb_window_watcher(hub, a, idxs)
+    label = ("all" if [t.lower() for t in a.outputs] == ["all"]
+             else "+".join(OUTPUTS[i] for i in idxs)) + (" on" if on else " off")
+    if w:
+        w.mark(label)
+    rc = 0
     if [t.lower() for t in a.outputs] == ["all"]:
         hub.set_all(on)
         print(f"all outputs {'ON' if on else 'off'}")
-        return 0
-    rc = 0
-    for i in parse_outputs(a.outputs):
-        try:
-            hub.set_output(i, on)
-            print(f"{OUTPUTS[i]} {'ON' if on else 'off'}")
-        except Refused as e:
-            print(f"FAILED: {e}", file=sys.stderr)
-            rc = 2
+    else:
+        for i in idxs:
+            try:
+                hub.set_output(i, on)
+                print(f"{OUTPUTS[i]} {'ON' if on else 'off'}")
+            except Refused as e:
+                print(f"FAILED: {e}", file=sys.stderr)
+                rc = 2
+    if w:
+        print(f"watching USB for {win:g} s ...", flush=True)
+        w.watch_for(win)
+        n = len(w.history)
+        print(f"USB: {n} change{'s' if n != 1 else ''} within {win:g} s of {label}")
     return rc
+
+
+def cmd_cycle(hub, a):
+    """cycle <outputs...|all> [--off-time S] [--watch S]: switch outputs off, wait, switch them
+    back on, and report which host USB devices disappeared and came back, with timings.
+
+    Only outputs that are on are cycled (an output already off stays off; a cycle never turns on
+    something that was off). If all seven are on, the firmware all-off/all-on commands are used.
+    The on switch is in a finally block, so Ctrl+C or an error during the off time still restores
+    the outputs (see restore(): per-output retries, ~10 s across comm errors); any output still
+    off afterwards is named on stderr. Exit: 0; 2 if a switch was refused or an output is still
+    off (this wins over 130); 3 if a device that disappeared did not come back within --watch s;
+    130 if interrupted during the off time and every output was switched back on (the report is
+    skipped). Ctrl+C at other moments still runs the restore (finally) and then propagates.
+
+    NOT yet tested on hardware. If the box's own CH340 were powered through a switched USB output,
+    switching that output off would cut this program off from the hub with the output still off;
+    the identified hub and bridge are printed first so that can be checked (`sv241.py usb`)."""
+    outs, _ = hub.state()
+    want = switch_targets(a.outputs)
+    idxs = [i for i in want if outs[i]]
+    for i in want:
+        if not outs[i]:
+            print(f"{OUTPUTS[i]} is off; not cycled")
+    if not idxs:
+        print("nothing to cycle")
+        return 0
+    use_all = len(idxs) == len(OUTPUTS)
+    names = "all" if use_all else "+".join(OUTPUTS[i] for i in idxs)
+    w = UsbWatcher("all", port=lambda: hub.port or a.port, hub_spec=a.usb_hub, sink=ts_print)
+    w.poll()
+    if not w.available:
+        print("continuing without USB monitoring")
+    DBG.log("cycle", outputs=[OUTPUTS[i] for i in idxs], off_time=a.off_time, watch=a.watch)
+    rc = 0
+
+    def switch_off():
+        if use_all:
+            hub.set_all(False)
+        else:
+            for i in idxs:
+                hub.set_output(i, False)
+        print(f"{names} off", flush=True)
+
+    def restore():
+        """Switch every cycled output back on; returns the indexes still off afterwards.
+        Up to 20 rounds (~10 s with the 0.5 s pause after a comm error). All-on is tried first
+        when all seven were cycled; if it doesn't take, outputs are switched one by one. Each
+        output is tried separately, so one refusal doesn't stop the rest; an output refused in 3
+        rounds is given up on. Ctrl+C during the restore is ignored so it can't be cut short."""
+        left, bulk, refused = list(idxs), use_all, collections.Counter()
+        for _ in range(20):
+            if not left:
+                break
+            try:
+                if bulk:
+                    bulk = False                    # one try; per-output on any failure
+                    hub.set_all(True)
+                    left = []
+                    continue
+                for i in list(left):
+                    try:
+                        hub.set_output(i, True)
+                        left.remove(i)
+                    except Refused as e:
+                        refused[i] += 1
+                        print(f"FAILED: {e}", file=sys.stderr)
+                if left and all(refused[i] >= 3 for i in left):
+                    break
+            except Refused as e:                    # from set_all
+                print(f"FAILED: {e}", file=sys.stderr)
+            except CommError as e:
+                hub.close()
+                print(f"comm error while switching back on (retrying): {e}", file=sys.stderr)
+                try:
+                    time.sleep(0.5)
+                except KeyboardInterrupt:
+                    print("restoring outputs; Ctrl+C ignored", file=sys.stderr)
+            except KeyboardInterrupt:
+                print("restoring outputs; Ctrl+C ignored", file=sys.stderr)
+        return left
+
+    w.mark(f"{names} off")
+    t_off = time.monotonic()
+    interrupted = False
+    still_off = []
+    try:
+        switch_off()
+        try:
+            w.watch_for(a.off_time)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("interrupted: switching back on now", flush=True)
+    finally:
+        w.mark(f"{names} on")
+        t_on = time.monotonic()
+        still_off = restore()
+        if still_off:
+            print(f"error: STILL OFF after cycle: {', '.join(OUTPUTS[i] for i in still_off)} "
+                  "(switch them on with 'sv241.py on ...')", file=sys.stderr)
+            DBG.log("cycle_restore_failed", still_off=[OUTPUTS[i] for i in still_off])
+        else:
+            print(f"{names} ON", flush=True)
+    if still_off:
+        return 2                                   # takes precedence over 130: outputs not restored
+    if interrupted:
+        return 130
+    w.watch_for(a.watch)
+    if w.available:
+        lines, missing = usb_cycle_report(w, t_off, t_on, a.watch)
+        print(f"USB summary ({names} off {a.off_time:g} s, watched {a.watch:g} s after on):")
+        for ln in lines:
+            print(ln)
+        if missing and rc == 0:
+            rc = 3
+    return rc
+
+
+def cmd_usb(a):
+    """usb [--watch [--all] [--interval S]]: host-side USB view; never opens the serial port, so
+    it can run while NINA holds the hub.
+
+    Without --watch: list every USB device as a tree, marking the SV241 hub(s), its CH340 bridge
+    and everything behind the hub. With --watch: report connects/disconnects below the SV241 hub
+    (every device with --all) until Ctrl+C."""
+    port = a.port
+    if port is None:
+        try:
+            port = pick_port(list_serial_ports())[0]
+        except CommError:
+            port = None
+    if not a.watch:
+        snap = usb_snapshot()
+        hubs, bridge, note = find_sv241_hubs(snap, port, a.usb_hub)
+        below = usb_subtree(snap, hubs)
+        kids = collections.defaultdict(list)
+        for d in snap.values():
+            kids[d.parent if d.parent in snap else None].append(d)
+
+        def walk(parent, depth):
+            for d in sorted(kids[parent], key=lambda x: x.key):
+                tag = ("   <- SV241 hub" if d.key in hubs else "   <- SV241 serial bridge" if d.key == bridge
+                       else "   (behind SV241)" if d.key in below else "")
+                print("  " * depth + usb_label(d) + tag)
+                walk(d.key, depth + 1)
+        walk(None, 0)
+        if not snap:
+            print("no USB devices found")
+        if note:
+            print(f"note: {note}")
+        DBG.log("usb_list", hubs=hubs, bridge=bridge, note=note,
+                devices=[dict(usb_record(d), below_hub=d.key in below) for d in snap.values()])
+        return 0
+    if a.interval < 0.1:
+        print("error: --interval must be at least 0.1 s", file=sys.stderr)
+        return 2
+    w = UsbWatcher("all" if a.all else "hub", port=port, hub_spec=a.usb_hub, sink=ts_print)
+    w.poll()
+    if not w.available:
+        return 1
+    what = "USB devices" if a.all else "devices behind the SV241 hub"
+    ts_print(f"watching {w.count()} {what}, polling every {a.interval:g} s (Ctrl+C to stop)")
+    n, max_polls = 0, getattr(a, "max_polls", None)
+    try:
+        while max_polls is None or n < max_polls:
+            time.sleep(a.interval)
+            w.poll()
+            n += 1
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def cmd_set(hub, a):
@@ -950,6 +1892,8 @@ class Holder:
         self.energy_wh = 0.0              # integrated from power samples
         self._last_pwr = None             # (monotonic time, watts) of the previous sample
         self._last_event = ""
+        self._ev_lock = threading.Lock()  # event() is also called from the USB watcher thread
+        self.usb = None                   # UsbWatcher when --usb-watch (see start_usb)
         self.csv = None
         if a.csv:
             new = not os.path.exists(a.csv)
@@ -961,12 +1905,35 @@ class Holder:
                                    "cutoff_predicted", "event"])
 
     def event(self, msg):
-        """Record a timestamped event; with --no-clear also print it (service-friendly log)."""
-        line = f"{time.strftime('%H:%M:%S')} {msg}"
-        self.events.append(line)
-        self._last_event = msg
-        if self.a.no_clear:
-            print(line, flush=True)
+        """Record a timestamped event; with --no-clear also print it (service-friendly log).
+        Every event is also an `event` debug record. Thread-safe (USB watcher thread)."""
+        with self._ev_lock:
+            line = f"{time.strftime('%H:%M:%S')} {msg}"
+            self.events.append(line)
+            self._last_event = msg
+            DBG.log("event", msg=msg)
+            if self.a.no_clear:
+                print(line, flush=True)
+
+    def event_list(self):
+        """Copy of the recent events, taken under the lock (the USB watcher thread appends to
+        the deque, and iterating a deque while it is mutated raises RuntimeError)."""
+        with self._ev_lock:
+            return list(self.events)
+
+    def start_usb(self, port=None):
+        """With --usb-watch, start a background UsbWatcher whose lines become events: scope
+        "hub" (devices behind the SV241 hub), or "all" with --usb-all. No-op otherwise."""
+        if not getattr(self.a, "usb_watch", False):
+            return
+        self.usb = UsbWatcher("all" if getattr(self.a, "usb_all", False) else "hub",
+                              port=port or (lambda: self.hub.port or self.a.port),
+                              hub_spec=getattr(self.a, "usb_hub", None), sink=self.event)
+        self.usb.start(getattr(self.a, "usb_interval", 1.0))
+
+    def stop_usb(self):
+        if self.usb:
+            self.usb.stop()
 
     def poll(self):
         """One cycle: read state + sensors, report reboots/cutoff transitions, enforce targets
@@ -1092,19 +2059,25 @@ class Holder:
                          + ("   -> firmware holds PWM1 at 0" if margin < 0 else ""))
             elif lens is None:
                 L.append("  Lens probe not connected: firmware cutoff cannot trigger")
+        if self.usb:
+            n = self.usb.count()
+            L.append(f"\nUSB  {'n/a' if n is None else n} device(s) "
+                     + ("on the host" if self.usb.scope == "all" else "behind the SV241 hub")
+                     + ("" if self.usb.available else "   (monitoring unavailable)"))
         c = self.counts
         L.append(f"\nCounts  re-pushes ADJ {c['push_adj']}  PWM1 {c['push_pwm1']}  PWM2 {c['push_pwm2']}   "
                  f"cutoffs {c['cutoff']}   push failures {c['fail_adj'] + c['fail_pwm1'] + c['fail_pwm2']}   "
                  f"hub reboots {c['reboot']}   comm errors {c['comm']}")
-        L.append("\nRecent events" + ("" if self.events else ": none"))
-        L.extend("  " + e for e in self.events)
+        L.append("\nRecent events" + ("" if self.event_list() else ": none"))
+        L.extend("  " + e for e in self.event_list())
         L.append("\nCtrl+C to quit (settings are left as they are)")
         sys.stdout.write("\033[2J\033[H" + "\n".join(L) + "\n")
         sys.stdout.flush()
 
     def run(self, max_polls=None):
         """Main hold loop: optionally adopt current levels as targets, then poll every
-        --interval seconds until Ctrl+C (or max_polls, for tests). Closes the CSV on exit."""
+        --interval seconds until Ctrl+C (or max_polls, for tests). Starts/stops the USB watcher
+        (--usb-watch) around the loop and closes the CSV on exit."""
         if self.a.hold_current:
             _, dev = self.hub.state()
             for name in CHANNELS:
@@ -1116,8 +2089,10 @@ class Holder:
             or "none (monitor only)"
         self.event(f"started; targets: {desc}")
         try:
+            self.start_usb()
             self._loop(max_polls)
         finally:
+            self.stop_usb()
             if self.csv:
                 self.csv_f.close()
 
@@ -1302,11 +2277,16 @@ class Tui:
 
     # --- actions -------------------------------------------------------------------------
     def set_output(self, i, on):
-        """Switch one output (verified by Hub.set_output). Untested on hardware."""
+        """Switch one output (verified by Hub.set_output). Untested on hardware. With
+        --usb-watch, USB changes after it are timed from this switch."""
+        if self.holder.usb:
+            self.holder.usb.mark(f"{OUTPUTS[i]} {'on' if on else 'off'}")
         self.act(lambda: self.hub.set_output(i, on), f"{OUTPUTS[i]} switched {'ON' if on else 'off'}")
 
     def set_all(self, on):
-        """Firmware all-on / all-off. Untested on hardware."""
+        """Firmware all-on / all-off. Untested on hardware. Marks the USB watcher like set_output."""
+        if self.holder.usb:
+            self.holder.usb.mark(f"all {'on' if on else 'off'}")
         self.act(lambda: self.hub.set_all(on), f"all outputs switched {'ON' if on else 'off'}")
 
     def apply_level(self, name, raw):
@@ -1376,7 +2356,9 @@ class Tui:
 
     # --- input ---------------------------------------------------------------------------
     def handle(self, k):
-        """Dispatch one key token. An open prompt (confirm / value entry) takes all keys."""
+        """Dispatch one key token. An open prompt (confirm / value entry) takes all keys.
+        Each key is a `key` debug record (with the selected row and whether a prompt was open)."""
+        DBG.log("key", key=k, row="%s:%s" % self.row(), prompt=self.prompt[0] if self.prompt else None)
         if self.prompt:
             return self._handle_prompt(k)
         kind, which = self.row()
@@ -1511,6 +2493,12 @@ class Tui:
                          + (f"{RED}  -> firmware holds PWM1 at 0{RST}" if m < 0 else ""))
             elif lens is None:
                 L.append("  Lens probe not connected: PWM1 cutoff cannot trigger")
+        if h.usb:
+            n = h.usb.count()
+            L.append("")
+            L.append(f"  USB {'n/a' if n is None else n} device(s) "
+                     + ("on the host" if h.usb.scope == "all" else "behind the SV241 hub")
+                     + ("" if h.usb.available else f"{RED}  monitoring unavailable{RST}"))
         # footer: message/prompt + key help, events fill whatever height is left
         foot = ["", *(f"{DIM}{k}{RST}" for k in KEY_HELP)]   # prompt goes last: kept on tiny screens
         if self.prompt and self.prompt[0] == "edit":
@@ -1523,7 +2511,7 @@ class Tui:
             foot.append(self.msg)
         room = height - len(L) - len(foot) - 2
         if room > 0:
-            ev = list(h.events)[-room:]
+            ev = h.event_list()[-room:]
             L.append("")
             L.append(f"{DIM}  Events{RST}")
             L.extend("  " + e for e in ev)
@@ -1562,6 +2550,7 @@ class Tui:
                 h.targets.setdefault(name, dev[name])
         desc = ", ".join(f"{k.upper()}={fmt_level(k, v)}" for k, v in h.targets.items()) or "none"
         h.event(f"TUI started; held: {desc}")
+        h.start_usb()
         self.out.write("\033[?1049h\033[?25l\033[2J")      # alternate screen, hide cursor
         last_draw = 0.0
         old_sig = {}
@@ -1615,6 +2604,7 @@ class Tui:
                         signal.signal(getattr(signal, name), old)
                     except (ValueError, OSError, TypeError):
                         pass
+            h.stop_usb()
             if h.csv:
                 h.csv_f.close()
 
@@ -1671,6 +2661,12 @@ def build_parser():
     ap.add_argument("--port", help="COMx, /dev/ttyUSBx (Linux) or /dev/cu.usbserial-x / "
                     "/dev/cu.wchusbserialx (macOS); default: first CH340 found")
     ap.add_argument("--timeout", type=float, default=0.4, help="reply timeout in s (default 0.4)")
+    ap.add_argument("--debug", metavar="FILE",
+                    help="append a structured JSONL trace (serial frames, decodes, writes, events, USB "
+                         "changes) to FILE; '-' = stderr (not with tui)")
+    ap.add_argument("--usb-hub", metavar="SPEC",
+                    help="SV241 USB hub override for USB monitoring: comma-separated device keys or "
+                         "VID:PID (see 'usb'); default: the CH340 bridge's parent hub + USB3 companion")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("status", help="outputs, PWM/ADJ levels and sensors")
     p.add_argument("--json", action="store_true")
@@ -1680,6 +2676,18 @@ def build_parser():
     for n in ("on", "off"):
         p = sub.add_parser(n, help=f"switch outputs {n}: dc1..dc5, usbc, usba, or all")
         p.add_argument("outputs", nargs="+")
+        p.add_argument("--usb-window", type=float, metavar="S",
+                       help=f"watch host USB changes for S s after switching (default {USB_WINDOW_S:g} "
+                            "when usbc/usba/all is switched, else 0 = off)")
+    p = sub.add_parser("cycle", help="switch outputs off, wait, back on; report USB devices lost/regained")
+    p.add_argument("outputs", nargs="+")
+    p.add_argument("--off-time", type=float, default=3.0, help="seconds to stay off (default 3)")
+    p.add_argument("--watch", type=float, default=10.0,
+                   help="seconds to watch for devices returning after switching on (default 10)")
+    p = sub.add_parser("usb", help="host USB devices behind the SV241 hub (no serial port used)")
+    p.add_argument("--watch", action="store_true", help="report connects/disconnects until Ctrl+C")
+    p.add_argument("--all", action="store_true", help="with --watch: every USB device, not only the SV241's")
+    p.add_argument("--interval", type=float, default=0.5, help="poll interval for --watch (default 0.5 s)")
     p = sub.add_parser("set", help="set adj (volts), pwm1/pwm2 (percent), or raw:N")
     p.add_argument("channel", type=str.lower, choices=sorted(CHANNELS))
     p.add_argument("level")
@@ -1697,6 +2705,10 @@ def build_parser():
     p.add_argument("--csv", help="append every poll to this CSV file")
     p.add_argument("--events", type=int, default=10, help="recent events shown (default 10)")
     p.add_argument("--no-clear", action="store_true", help="no refreshing display; print events only")
+    p.add_argument("--usb-watch", action="store_true",
+                   help="log host USB connects/disconnects behind the SV241 hub as events")
+    p.add_argument("--usb-all", action="store_true", help="with --usb-watch: every USB device on the host")
+    p.add_argument("--usb-interval", type=float, default=1.0, help="USB poll interval (default 1 s)")
     p = sub.add_parser("tui", help="interactive live display: switch outputs, change levels with keys")
     p.add_argument("--adj", type=arg_level("adj"), help="hold ADJ OUT at this value from the start")
     p.add_argument("--pwm1", type=arg_level("pwm1"), help="hold PWM1 at this value from the start")
@@ -1705,23 +2717,27 @@ def build_parser():
     p.add_argument("--interval", type=float, default=2.0, help="seconds between polls (default 2)")
     p.add_argument("--csv", help="append every poll to this CSV file")
     p.add_argument("--events", type=int, default=50, help="event history kept (default 50)")
+    p.add_argument("--usb-watch", action="store_true",
+                   help="log host USB connects/disconnects behind the SV241 hub as events")
+    p.add_argument("--usb-all", action="store_true", help="with --usb-watch: every USB device on the host")
+    p.add_argument("--usb-interval", type=float, default=1.0, help="USB poll interval (default 1 s)")
     p.set_defaults(no_clear=False)
     return ap
 
 
 def insert_default_command(argv):
     """Old SVBONY-hold.py command lines have no command word: slot 'hold' in after the globals.
-    Global options may also appear among hold options (e.g. --pwm1 40 --port COM6), so move them
-    to the front."""
+    Global options (GLOBAL_OPTS) may also appear among hold options (e.g. --pwm1 40 --port COM6),
+    so move them to the front."""
     argv = list(argv)
     glob, rest, i = [], [], 0
     while i < len(argv):
         t = argv[i]
-        if t in ("--port", "--timeout") and i + 1 < len(argv):
+        if t in GLOBAL_OPTS and i + 1 < len(argv):
             glob += argv[i:i + 2]
             i += 2
             continue
-        if t.startswith("--port=") or t.startswith("--timeout="):
+        if t.startswith(tuple(o + "=" for o in GLOBAL_OPTS)):
             glob.append(t)
         else:
             rest.append(t)
@@ -1732,11 +2748,46 @@ def insert_default_command(argv):
 
 
 def main(argv=None, hub_factory=None):
-    """CLI entry point; returns the exit code. `set` levels, `on`/`off` names and `raw` hex
-    bytes are validated before the port is opened (ValueError -> exit 2), so a typo never
-    touches the hub. hub_factory replaces Hub (tests/fake_hub.py)."""
+    """CLI entry point; returns the exit code. `set` levels, `on`/`off`/`cycle` names, `raw` hex
+    bytes and time values are validated before the port is opened (exit 2), so a typo never
+    touches the hub. hub_factory replaces Hub (tests/fake_hub.py).
+
+    --debug FILE opens the JSONL trace (DBG) for the whole run: a `start` record (argv, platform,
+    Python and pyserial versions) first and an `exit` record (rc, or the exception) last."""
     argv = sys.argv[1:] if argv is None else argv
     a = build_parser().parse_args(insert_default_command(argv))
+    if a.debug:
+        if a.debug == "-" and a.cmd == "tui":
+            print("error: --debug - (stderr) would garble the tui screen; give a file name", file=sys.stderr)
+            return 2
+        try:
+            DBG.open(a.debug)
+        except OSError as e:
+            print(f"error: can't open debug log {a.debug}: {e}", file=sys.stderr)
+            return 2
+        try:
+            import serial
+            pyser = getattr(serial, "__version__", "?")
+        except ImportError:
+            pyser = None
+        DBG.log("start", argv=list(argv), cmd=a.cmd, platform=sys.platform, os_name=os.name,
+                python=sys.version.split()[0], pyserial=pyser, pid=os.getpid())
+    rc = None
+    try:
+        rc = _run(a, hub_factory)
+        return rc
+    except BaseException as e:
+        DBG.log("exit", rc=rc, exception=repr(e))
+        rc = "logged"
+        raise
+    finally:
+        if rc != "logged":
+            DBG.log("exit", rc=rc)
+        DBG.close()
+
+
+def _run(a, hub_factory):
+    """main() after argument parsing and debug-log setup: validate, then dispatch."""
     try:
         if a.cmd == "ports":
             try:
@@ -1744,10 +2795,22 @@ def main(argv=None, hub_factory=None):
             except CommError as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 1
+        if a.cmd == "usb":
+            try:
+                return cmd_usb(a)
+            except UsbUnavailable as e:
+                print(f"error: USB enumeration unavailable: {e}", file=sys.stderr)
+                return 1
         if a.cmd == "set":
             parse_level(a.channel, a.level)          # validate before touching the port
-        if a.cmd in ("on", "off") and [t.lower() for t in a.outputs] != ["all"]:
-            parse_outputs(a.outputs)
+        if a.cmd in ("on", "off", "cycle"):
+            switch_targets(a.outputs)
+        if a.cmd in ("on", "off") and a.usb_window is not None and not 0 <= a.usb_window <= 600:
+            raise ValueError("--usb-window must be 0..600 s")
+        if a.cmd == "cycle" and not (0 <= a.off_time <= 600 and 0 <= a.watch <= 600):
+            raise ValueError("--off-time and --watch must be 0..600 s")
+        if a.cmd in ("hold", "tui") and a.usb_interval < 0.1:
+            raise ValueError("--usb-interval must be at least 0.1 s")
         if a.cmd == "raw":
             parse_raw_bytes(a.bytes)
     except ValueError as e:
@@ -1755,16 +2818,18 @@ def main(argv=None, hub_factory=None):
         return 2
     hub = (hub_factory or Hub)(a.port, a.timeout)
     handler = {"status": cmd_status, "sensors": cmd_sensors, "on": cmd_switch, "off": cmd_switch,
-               "set": cmd_set, "raw": cmd_raw, "hold": cmd_hold, "tui": cmd_tui}[a.cmd]
+               "cycle": cmd_cycle, "set": cmd_set, "raw": cmd_raw, "hold": cmd_hold, "tui": cmd_tui}[a.cmd]
     try:
         if a.cmd in ("hold", "tui"):
             return handler(hub, a)               # hold manages (re)opening itself
         with hub:
             return handler(hub, a)
     except CommError as e:
+        DBG.log("comm_error", where=a.cmd, error=str(e))
         print(f"error: {e}", file=sys.stderr)
         return 1
     except Refused as e:
+        DBG.log("refused", where=a.cmd, error=str(e))
         print(f"FAILED: {e}", file=sys.stderr)
         return 2
     finally:
