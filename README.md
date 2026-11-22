@@ -50,7 +50,8 @@ back within `--watch`) and `130` (Ctrl+C during the off time; every output was s
 on). `2` wins over `130` if an output could not be switched back on. Settings persist on the
 hub (firmware auto-saves to flash every 5 s).
 
-`on`/`off`/`cycle` are **untested on hardware** (see Status).
+The `01` and FE/FF switching frames behind `on`/`off`/`all` and the host USB watch behind `cycle` are confirmed on hardware (Windows,
+2026-11-22); `cycle` itself and the TUI output keys have not been run on the hub (see Status).
 
 ### Debug log (`--debug FILE`, `--debug-text FILE`)
 
@@ -131,10 +132,17 @@ hold/TUI, 0.5 s for the silent `--debug` watcher), so read them as upper bounds.
 after Ctrl+C or an error (each output retried separately for ~10 s; any still off is named on
 stderr and the exit code is 2).
 
-**Check the hub identification once on the real box** (`python sv241.py usb`): it is inferred
-from the OS device tree and untested on hardware, and the Windows CfgMgr32 walk has never run on
-Windows. If the wrong hub is marked, or the CH340 turns out to hang directly off a PC
-port, pass `--usb-hub` with keys or `VID:PID` values from that listing (comma-separated).
+**Hub identification on the real box** (Windows, 2026-11-22): the CfgMgr32 walk works (22
+devices in 13–16 ms, keys stable between walks) and finds the CH340 on COM6. Its parent, the
+hub marked as the SV241's, is a `1A40:0101` (Terminus FE1.1s, USB 2) hub. The USB-C output's
+devices hang off it, but the USB-A output's devices do not. On the test box they sit under a VIA
+VL817 USB 3 hub (`2109:2817` USB 2 half, `2109:0817` SuperSpeed half, `2109:8817` billboard),
+which is the FE1.1s's parent on a PC root port. That VL817 is probably the SV241's own upstream
+hub; this is unconfirmed, because an external hub between PC and box would look the same. Until
+that is settled the default still marks only the CH340's parent. Pass
+`--usb-hub 2109:2817,2109:0817` to watch the USB-A devices too. Use `--usb-hub` likewise if the
+wrong hub is marked or the CH340 hangs directly off a PC port (comma-separated keys or `VID:PID`
+values from the `usb` listing).
 
 ### macOS / Linux
 
@@ -156,7 +164,8 @@ after plugging in: `sudo apt remove brltty` (or mask its udev rule).
 
 DTR/RTS: POSIX kernels raise both lines on open (pyserial does too); the script drops them
 immediately and clears `HUPCL`. Both together don't trip the ESP32 auto-reset circuit, but
-this is untested on the hub; a reset shows up as a "hub REBOOTED" event.
+this is untested on the hub (it is only connected to Windows, where pyserial lowers both before
+opening and three opens caused no reset); a reset shows up as a "hub REBOOTED" event.
 
 ### Hold mode
 
@@ -203,8 +212,8 @@ python sv241.py tui --hold-current --csv hub.csv
 
 Step keys are batched: one write 0.6 s after the last press. Every write is read back; refusals
 (e.g. PWM1 during dew cutoff) and comm errors show on the message line and in the event list,
-and the display keeps running. Rows flag the open items below: output switching unverified, ADJ
-volts approximate, PWM1 above 80 % (cutoff cycling). TUI flags: `--adj/--pwm1/--pwm2` (held
+and the display keeps running. Rows flag the open items below: output keys not yet tried on the
+hub, ADJ volts approximate. TUI flags: `--adj/--pwm1/--pwm2` (held
 from the start), `--hold-current`, `--interval` (default 2 s, min 1), `--csv`, `--events N`
 (history kept, default 50), `--usb-watch`/`--usb-all`/`--usb-interval`.
 
@@ -215,7 +224,9 @@ Needs a real console: cmd, PowerShell or Windows Terminal. In Git Bash/mintty us
 
 Firmware forces PWM1 to 0 and refuses writes while lens probe > limit (ambient > 15 °C: dew
 point + 7.5 °C; 0–15 °C: dew point + 10 °C; < 0 °C: 5 °C fixed), then restores the previous level
-itself. No hysteresis, so a strong heater cycles. Hold mode detects this (refusal ack + its own
+itself (the level saved when the cutoff started, not a value written during it). No hysteresis,
+so the cutoff acts as a bang-bang thermostat at the limit whenever the heater can push the lens
+past it: on hardware 70, 75 and 80 % all cycled (see Status). Hold mode detects this (refusal ack + its own
 copy of the calculation) and reports it rather than treating it as a lost setting. PWM2 has no
 cutoff.
 
@@ -227,35 +238,57 @@ fully on or off. Use hold mode's Avg / Wh, not Max.
 
 ## Status
 
-**Tested on hardware** (2026-11-20/21, Windows, COM6, Python 3.13, pyserial 3.5): all reads,
-PWM2 write/restore, hold mode, checksums, `0x04` = lens probe, base-255 sensor decode, PWM1
-cutoff formula.
+**Tested on hardware** (Windows, COM6, Python 3.13, pyserial 3.5):
 
-**Untested on hardware** (simulator / synthetic data only):
+- 2026-11-20/21: all reads, PWM2 write/restore, hold mode, checksums, `0x04` = lens probe,
+  base-255 sensor decode, PWM1 cutoff formula.
+- 2026-11-22 (bench script; results in the project thread):
+  - Output switching. `01` on idx 0–6 is acked `FF` and reads back as written, about 57 ms for
+    write plus verify. The all-off and all-on frames are acked `24 06 FF FF FF 2A` and
+    `24 06 FE FE FF 28`, and read back all off / all on.
+  - Physical mapping. idx 4 = DC5 was seen on the box. DC1–DC4 had no visible load, so only
+    their read-back is confirmed.
+  - USB-C (idx 5) cuts the devices on the FE1.1s hub. USB-A (idx 6) cuts the devices under the
+    VL817 hub (see Host USB monitoring).
+  - The serial link stays up with either USB output off; the CH340 never dropped.
+  - Re-enumeration. Devices are gone at the first 0.2 s poll; downstream hubs and their children
+    take up to about 2.6 s. Devices are back 0.5–1.8 s after switching on.
+  - The Windows CfgMgr32 USB walk works. Hub identification works, but see the open item below.
+  - Port open via pyserial (DTR/RTS low before open) does not reset the hub: 3 opens, no boot
+    banner.
+  - The `msvcrt` key decoding is correct for injected console keys: arrows, Enter, Esc,
+    Backspace, Space, `q , . + - j k`.
+  - PWM1 cutoff details: writes are refused during the cutoff; on release the firmware restores
+    the level saved at cutoff entry.
 
-- DC/USB output switching: `on`/`off`, all on/off, `cycle`, TUI output keys.
+**Not yet tested on hardware** (simulator / synthetic data only):
+
+- `cycle` as a command and the TUI output keys (the frames and USB watching they use are
+  confirmed).
 - ADJ OUT volts scale (`set adj <V>`, `--adj <V>`).
-- Host USB monitoring, including SV241 hub identification on every OS and the Windows CfgMgr32
-  walk.
-- TUI mode: only against `tests/fake_hub.py` on Linux; not on the hub or on Windows (the
-  `msvcrt` key path is untested).
-- macOS/Linux termios backend: only over a pty against the simulator on Linux; not on a real
-  CH340 or on macOS.
+- The TUI on the hub. Only its Windows key decoding is confirmed; the rest ran only against
+  `tests/fake_hub.py` on Linux.
+- macOS/Linux termios backend and the POSIX DTR/RTS open: the hub is only connected to Windows.
+  These ran only over a pty against the simulator on Linux; not on a real CH340 or on macOS.
+- Host USB monitoring on Linux/macOS (simulated sysfs / ioreg only).
 
 Open:
 
-- **DC/USB output switching untested on hardware** (`on`/`off`, all-on/off, `cycle`). Frames
-  are firmware-verified; physical mapping idx 0 = DC1 etc. not yet bench-checked. Before the
-  first USB `cycle`, run `usb` and confirm the CH340 sits behind the SV241 hub rather than being
-  powered through a switched USB output (if it were, switching that output off would cut the
-  script off with the output left off).
-- **Host USB monitoring** is tested only against simulated device trees (fake sysfs, CfgMgr32
-  node lists, sample ioreg output); the ctypes CfgMgr32 walk has not run on Windows yet.
+- **DC1–DC4 physical mapping** (idx 0–3) not seen on the box: nothing visible was plugged in
+  during the test. idx 4 = DC5 matched.
+- **SV241 hub boundary.** The USB-A output's devices hang off a VL817 hub above the
+  CH340's FE1.1s parent, so the default identification misses them. It is unclear whether that
+  VL817 is inside the box (see Host USB monitoring); `--usb-hub 2109:2817,2109:0817` until
+  then.
 - **ADJ OUT volts per raw step unknown.** `set adj <V>` uses the vendor app's 15.3 V @ raw 253
   linear assumption; ADJ is a 40 kHz PWM into a regulator, so the real curve needs a meter. Use
   `raw:N` when it matters.
-- **PWM1 at 100 % cycles** at the cutoff edge (lens sits ~0.2–0.6 °C under the limit). ~70–80 %
-  is recommended.
+- **PWM1 cycles at 70–80 % as well as at 100 %.** The earlier advice that ~70–80 % avoids
+  cycling is withdrawn. On 2026-11-22 (ambient 16.7 °C, RH 79–81 %, limit = dew point + 7.5 ≈
+  20.6–21.1 °C) each of 70, 75 and 80 % held for 10 min spent 53–59 % of the 5 s samples in
+  cutoff. That was 4–5 episodes per 10 min, about 75 s on and 95 s cut, with the lens within
+  ±0.5 °C of the limit. In those conditions the duty only changes how fast the lens reaches the
+  limit. Whether a lower duty stays clear in colder or drier air is untested.
 - `0x02` power scale unclear (raw ≈ 1/12.5 of vendor-formula W); the script computes power
   from V × I instead.
 
@@ -273,6 +306,6 @@ Open:
 
 The Python files carry detailed comment blocks: a module header (purpose, usage, protocol
 summary pointing at `docs/PROTOCOL.md`), docstrings on classes and functions, and inline notes on
-non-obvious protocol details (checksum, base-255 decode, PWM1 cutoff, DTR/RTS, untested output
-switching). Keep them accurate in every change: update a comment whenever the code it describes
+non-obvious protocol details (checksum, base-255 decode, PWM1 cutoff, DTR/RTS, the unmeasured
+ADJ scale). Keep them accurate in every change: update a comment whenever the code it describes
 changes, and update `docs/PROTOCOL.md` when protocol knowledge changes.

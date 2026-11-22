@@ -5,7 +5,7 @@ ESP32 (firmware V1.3, banner `SV241Pro V1.3 2025-12-18`) behind a CH340 USB-seri
 the same serial port.
 
 Tags: **[F]** confirmed in V1.3 firmware (strings, or disassembly of the serial parser at
-`0x400d307c` and reply builder at `0x400d22f4`). **[H]** confirmed on hardware (COM6, 2026-11-20/21).
+`0x400d307c` and reply builder at `0x400d22f4`). **[H]** confirmed on hardware (COM6, Windows, 2026-11-20/21/22).
 **[C]** observed device behaviour from earlier client code, not provable from code. **[V]** vendor
 Readme. **[A]** vendor app convention. **[I]** inferred.
 
@@ -19,7 +19,7 @@ the original hold script (superseded by `sv241.py`), `svbony-probe.py`.
 | --- | --- | --- |
 | Bridge | CH340, VID:PID `1A86:7523` | C |
 | Line | 115200 8N1, no flow control | C |
-| DTR / RTS | Must be low **before** `open()`; asserting them resets the ESP32 (auto-reset circuit) | C |
+| DTR / RTS | Must be low **before** `open()`; asserting them resets the ESP32 (auto-reset circuit). Opening with both low (pyserial, Windows) caused no reset in 3 opens | C, H |
 | DTR / RTS on POSIX | Kernel raises both on open before a program can lower them; both high together should not trip the standard two-transistor auto-reset, but untested on this hub (a boot banner afterwards would show it does) | I |
 | Settle | 0.3 s after open before the first command | C |
 | Exclusivity | One process per port: vendor app, NINA driver, scripts are mutually exclusive | C |
@@ -62,18 +62,19 @@ The firmware dispatches 11 commands: `0x00`–`0x08`, `0xFE`, `0xFF`. Others are
 | `06` | Humidity | – | sensor value: %RH + 255 | F |
 | `07` | INA219 current | – | sensor value: mA (uncalibrated) | F |
 | `08` | Read state | – | 7 output bytes (0/1), ADJ, PWM1, PWM2 (raw 0–255) | F, H |
-| `FE` | All outputs on | `FE`, – | `FE FF` (reply cmd `FE`) | F |
-| `FF` | All outputs off | `FF`, – | `FF FF` (reply cmd `FF`) | F |
+| `FE` | All outputs on | `FE`, – | `FE FF` (reply cmd `FE`): `24 06 FE FE FF 28` | F, H |
+| `FF` | All outputs off | `FF`, – | `FF FF` (reply cmd `FF`): `24 06 FF FF FF 2A` | F, H |
 
 **Outputs use `0x00`/`0xFF`, not 0/1.** For idx 0–6, `01` accepts only `00` (off) or `FF` (on);
 anything else is refused with ack `idx, 00` and changes nothing [F]. `08` reports outputs as 0/1.
-Output switching (`01` on idx 0–6, `FE`, `FF`) is **untested on hardware**; only the firmware
-code path is known.
+Output switching (`01` on idx 0–6, `FE`, `FF`) is confirmed on hardware [H]: acks `FF`, the `08`
+read-back follows, and the physical output changes (idx 4 = DC5, idx 5 = USB-C and idx 6 = USB-A
+seen on the box; DC1–DC4 had no visible load).
 DC1 on: `24 06 01 00 FF 2B`; DC1 off: `24 06 01 00 00 2B`.
 
 **All on / off.** `FE`/`FF` start an RTOS task (`TASK_SET_ALL_FORCE_ON`/`_OFF`) that switches all 7
 outputs; it acts only if `b3` repeats the command byte: `24 06 FE FE 00 28`, `24 06 FF FF 00 2A`.
-PWM and ADJ untouched [F].
+PWM and ADJ untouched [F]. Both act at once on hardware: the read-back 150 ms later is all off / all on [H].
 
 **State reply** (`08`, 14 bytes):
 
@@ -85,9 +86,9 @@ PWM and ADJ untouched [F].
 
 | Idx | Output | GPIO | Set value (`01`) | Tag |
 | --- | --- | --- | --- | --- |
-| 0–4 | DC1–DC5 | 13, 12, 14, 27, 26 | `00` off / `FF` on (idx → jack mapping not bench-checked) | F |
-| 5 | USB-C | 19 | `00` / `FF` | F |
-| 6 | USB-A | 18 | `00` / `FF` | F |
+| 0–4 | DC1–DC5 | 13, 12, 14, 27, 26 | `00` off / `FF` on (idx 4 = DC5 seen on the box; 0–3 read-back only) | F, H |
+| 5 | USB-C | 19 | `00` / `FF` (USB VBUS: devices drop and re-enumerate) | F, H |
+| 6 | USB-A | 18 | `00` / `FF` (same) | F, H |
 | 7 | ADJ OUT | 25 (LEDC ch1, 40 kHz) | raw 0–255 → duty round(raw/255 × 1023) | F |
 | 8 | PWM1 (dew cutoff) | 33 (LEDC ch2, 10 Hz) | same; refused during cutoff | F, H |
 | 9 | PWM2 | 32 (LEDC ch3, 10 Hz) | same | F, H |
@@ -158,10 +159,16 @@ from SHT4x ambient temperature and humidity, every 5 s:
 - Lens > limit: firmware saves PWM1 duty and mode, sets duty 0, mode 2, drives LEDC ch2 to 0.
   `01` writes to idx 8 are acked `08 00` (refused) while mode = 2. ADJ and PWM2 writes are never
   refused.
-- Lens ≤ limit: firmware restores the saved duty and mode itself.
+- Lens ≤ limit: firmware restores the saved duty and mode itself [H]: a level written (and
+  refused) during the cutoff is not what comes back, e.g. cutoff entered at raw 177, a write of
+  190 refused, release returned 177. A state read during the cutoff shows PWM1 = 0, so a client
+  cannot see the configured level until release.
 - A `01` write to idx 8 sets mode 1.
-- No hysteresis: a strong heater cycles on/off. Observed at 100 %: lens sits 0.2–0.6 °C under
-  the limit and cycles; ~70–80 % avoids it [H].
+- No hysteresis, so it works as a bang-bang thermostat at the limit [H]. At 100 % the lens sat
+  0.2–0.6 °C under the limit and cycled (2026-11-20). At 70, 75 and 80 % (2026-11-22, ambient
+  16.7 °C, RH 79–81 %, limit ≈ 20.6–21.1 °C) it also cycled: 53–59 % of samples in cutoff, roughly
+  75 s on / 95 s off, lens within ±0.5 °C of the limit. A lower duty in that range does not
+  avoid it.
 - No lens probe (−127 °C), or RH ≤ 0 (dew point taken as −100 °C): cutoff cannot trip.
 - Dew point: Magnus, a = 17.27, b = 237.7 [C]:
 
@@ -182,11 +189,13 @@ subtract 4 again.
 
 ## Open items
 
-- [ ] Bench-check an output write (`24 06 01 00 FF 2B`, then `24 06 08 00 00 32`) to confirm
-      idx 0 = DC1 physically; DC/USB switching untested on hardware.
+- [ ] See which physical jack idx 0–3 drive (DC1–DC4; idx 4 = DC5 confirmed).
 - [ ] Measure ADJ OUT volts vs raw (not traceable in code: firmware only sets a 40 kHz duty on GPIO25).
-- [ ] Confirm the POSIX open (DTR+RTS raised together, then dropped) does not reset the ESP32.
+- [ ] Confirm the POSIX open (DTR+RTS raised together, then dropped) does not reset the ESP32
+      (hub only on Windows so far; the Windows/pyserial open is confirmed).
 - [ ] Scale `02` power (1/12.5 observed vs 1/15.57 predicted by the current factor).
 - [x] `04` = lens, `05` = ambient (hardware).
+- [x] Output switching `01` idx 0–6, `FE`, `FF`: acks, read-back, USB-C/USB-A VBUS (hardware).
+- [x] PWM1 cutoff: refusal during cutoff, saved-level restore on release (hardware).
 - [x] Base-255 decode, PWM1 cutoff formula, PWM2 write/read-back (hardware).
 - [x] −4 °C correction and cutoff routine traced (ambient only, `0x400d19ac`).

@@ -135,9 +135,9 @@ class TuiTests(unittest.TestCase):
 
     def test_selected_row_keeps_status_text(self):
         t, _ = new_tui()
-        select(t, "ch", "pwm1")
-        row = [ln for ln in t.lines(130, 48) if "PWM1" in ln and ">" in ln][0]
-        self.assertIn("cycles at cutoff edge", row)
+        select(t, "ch", "adj")
+        row = [ln for ln in t.lines(130, 48) if "ADJ" in ln and ">" in ln][0]
+        self.assertIn("(volts approximate)", row)
         for w in (20, 40, 60):
             self.assertLessEqual(max(sv241.visible_len(ln) for ln in t.lines(w, 48)), w)
 
@@ -651,6 +651,49 @@ class UsbWatcherTests(unittest.TestCase):
             h.stop_usb()
             sv241.usb_snapshot = orig
         self.assertTrue(any("DISCONNECTED" in e and "ASI120MM" in e for e in h.events), list(h.events))
+
+
+class CycleReportTests(unittest.TestCase):
+    """usb_cycle_report on a hand-built history; the sequence is the one seen on the real hub
+    (2026-11-22, USB-C cycle): an ESP32-S3 accessory shows up as 303A:1001 for 0.6 s at power-up,
+    then re-enumerates as 03C3:1F10."""
+
+    def test_boot_identity_is_transient_not_missing(self):
+        hid = dev("hid", "1-2", 0x03C3, 0x1F10, "USB Input Device")
+        rom = dev("rom", "1-2", 0x303A, 0x1001, "USB Composite Device")
+        w = type("W", (), {})()
+        t_off, t_on = 100.0, 106.0
+        w.history = [(99.0, "-", CAM, True),                        # before the cycle: ignored
+                     (100.27, "-", hid, True), (100.27, "-", CAM, True),
+                     (106.48, "+", rom, True), (106.70, "+", CAM, True),
+                     (107.13, "-", rom, True), (107.55, "+", hid, True)]
+        lines, missing = sv241.usb_cycle_report(w, t_off, t_on, 15)
+        self.assertEqual(missing, 0, lines)
+        text = "\n".join(lines)
+        self.assertRegex(text, r"gone \+0\.27 s after off, back \+1\.55 s after on: 03C3:1F10")
+        self.assertRegex(text, r"gone \+0\.27 s after off, back \+0\.70 s after on: 03C3:120E")
+        self.assertRegex(text, r"transient \+0\.48 s after on, gone again after 0\.65 s .*303A:1001")
+        self.assertNotIn("NOT back", text)
+
+    def test_flapping_device_judged_by_final_state(self):
+        w = type("W", (), {})()
+        w.history = [(100.5, "-", CAM, True), (102.0, "+", CAM, True), (104.0, "-", CAM, True)]
+        lines, missing = sv241.usb_cycle_report(w, 100.0, 106.0, 10)
+        self.assertEqual(missing, 1, lines)
+        self.assertIn("NOT back within 10 s", lines[0])
+        w.history.append((107.0, "+", CAM, True))
+        lines, missing = sv241.usb_cycle_report(w, 100.0, 106.0, 10)
+        self.assertEqual(missing, 0, lines)
+        self.assertIn("back +1.00 s after on", lines[0])
+
+    def test_missing_and_new(self):
+        new = dev("new", "1-2", 0x1234, 0x5678, "thing")
+        w = type("W", (), {})()
+        w.history = [(1.0, "-", CAM, True), (5.0, "+", new, False)]
+        lines, missing = sv241.usb_cycle_report(w, 0.5, 4.0, 10)
+        self.assertEqual(missing, 1)
+        self.assertIn("NOT back within 10 s", lines[0])
+        self.assertIn("new  +1.00 s after on", lines[1])
 
 
 class DebugImpliesUsbTests(unittest.TestCase):
