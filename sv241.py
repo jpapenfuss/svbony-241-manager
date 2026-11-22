@@ -46,7 +46,8 @@ Interactive mode (live display; switch outputs and change levels with the keyboa
     step ADJ 0.5 V / PWM 5 %, ',' '.' step 1 raw (writes are sent 0.6 s after the last key);
     e or Enter on a channel types an exact value (12, 40, raw:120); h holds/releases a channel
     (re-pushed like hold mode); a all on; x all off (asks y/N); r refresh now; q quit.
-    Output switching from the TUI is as UNTESTED on hardware as on/off.
+    The TUI's output keys have not been tried on the hub (the switching frames they send are
+    confirmed on hardware; see the hardware status below).
     Pure stdlib: ANSI escapes plus msvcrt (Windows) or termios (POSIX); no curses needed.
 
 Hold mode polls outputs, PWM/ADJ channels and sensors, shows them on a refreshing console display,
@@ -106,9 +107,11 @@ watcher every 0.5 s. Where it is used:
   usb      tree view, or --watch for a continuous log of devices behind the hub (--all: all)
   hold/tui --usb-watch adds USB changes to the event list (and CSV/debug log); in the TUI they
            are timed from the last output switch
-The hub identification is inferred from the OS device tree and NOT yet checked on the real box,
-and the Windows CfgMgr32 walk has never run on Windows: run `sv241.py usb` once and confirm the
-marked hub is the SV241's (--usb-hub to override).
+On the real box (Windows, 2026-11-22) the CfgMgr32 walk works. The CH340's parent is a
+1A40:0101 (FE1.1s) hub carrying the USB-C output's devices. The USB-A output's devices hang one
+level higher, under a VL817 USB 3 hub (2109:2817 + 2109:0817) that is probably the box's own
+upstream hub (unconfirmed). The default still marks only the CH340's parent; pass
+--usb-hub 2109:2817,2109:0817 to include the USB-A devices.
 
 Only one program can hold the serial port: close NINA's connection to the hub, the vendor app,
 or another running copy of this script first.
@@ -156,12 +159,18 @@ Protocol (firmware V1.3, disassembly-verified; full reference in docs/PROTOCOL.m
   DTR/RTS must be low before the port opens, or the ESP32 resets. The hub sends nothing
   unprompted except its "SV241Pro ..." boot banner, so seeing that means it rebooted.
 
-Hardware status (2026-11-20/21, COM6, Windows): reads, PWM2 write/read-back, hold mode,
-checksums, base-255 decode, 04 = lens / 05 = ambient and the PWM1 cutoff formula are confirmed.
-UNTESTED on hardware: DC/USB output switching (on/off, all on/off, cycle; follows the firmware
-disassembly), the ADJ volts scale, the TUI (simulator only, msvcrt key path never run), the
-termios backend on a real CH340 and macOS, and host USB monitoring including the SV241 hub
-identification (simulated device trees only: sysfs, CfgMgr32 node lists, ioreg text).
+Hardware status (COM6, Windows). Confirmed 2026-11-20/21: reads, PWM2 write/read-back, hold
+mode, checksums, base-255 decode, 04 = lens / 05 = ambient, the PWM1 cutoff formula.
+Confirmed 2026-11-22:
+  - output switching (01 idx 0..6 and FE/FF: acks, read-back; idx 4 = DC5 seen on the box, as
+    were the USB-C and USB-A VBUS cuts)
+  - the CfgMgr32 USB walk and host USB watching
+  - no reset on a pyserial open
+  - msvcrt key decoding
+  - PWM1 refusal during the cutoff and the firmware's saved-level restore
+UNTESTED on hardware: `cycle` and the TUI output keys as commands, the DC1..DC4 jack mapping, the
+ADJ volts scale, the TUI on the hub, the termios backend on a real CH340 / macOS (the hub is only
+on Windows), and the Linux/macOS USB backends (simulated sysfs / ioreg only).
 
 Known unknowns: the exact ADJ OUT volts-per-raw (UNTESTED: the vendor app's 15.3 V at raw 253,
 linear, is assumed; the firmware only sets a 40 kHz PWM duty, so the real scale depends on the
@@ -211,7 +220,8 @@ import time
 BAUD = 115200                     # CH340 line rate; 8N1, no flow control
 CH340 = (0x1A86, 0x7523)          # USB VID:PID of the hub's WCH CH340 bridge (auto-detect key)
 # Output names in hub index order: CMD 01 idx 0..6 and bytes 3..9 of the CMD 08 state reply.
-# idx 0 = DC1 follows the firmware GPIO table; not yet confirmed by a physical bench check.
+# Order follows the firmware GPIO table; idx 4 = DC5, 5 = USB-C, 6 = USB-A confirmed on the box
+# (2026-11-22). idx 0..3 = DC1..DC4 read back correctly but their jacks were not observed.
 OUTPUTS = ["DC1", "DC2", "DC3", "DC4", "DC5", "USB-C", "USB-A"]
 OUT_ALIASES = {n.lower().replace("-", ""): i for i, n in enumerate(OUTPUTS)}   # dc1, usbc, ...
 OUT_ALIASES.update({str(i + 1): i for i in range(5)})          # "1".."5" -> DC1..DC5
@@ -522,7 +532,8 @@ class PosixSerial:
     them); they are dropped immediately after, and HUPCL is cleared so close() doesn't pulse them.
     Raising both together does not trigger the ESP32 auto-reset circuit, which needs one without
     the other. (That relies on the standard ESP32 two-transistor auto-reset wiring; it is not yet
-    confirmed on this hub, so treat a "hub REBOOTED" event on POSIX open as a sign it is wrong.)"""
+    confirmed on this hub, which so far has only been used from Windows, so treat a "hub
+    REBOOTED" event on POSIX open as a sign it is wrong.)"""
 
     def __init__(self, port, baudrate=BAUD, timeout=0.05):
         """Open and configure `port`; raises CommError (busy, permission, not a tty, bad baud).
@@ -893,8 +904,8 @@ class Hub:
 
     def set_output(self, idx, on):
         """Switch output idx (0..6) on/off, verified via CMD 08; raises Refused on mismatch.
-        UNTESTED on hardware (firmware-derived; idx 0 = DC1 not bench-checked). Outputs take
-        00/FF, never 0/1."""
+        Confirmed on hardware 2026-11-22 (ack FF, read-back follows in ~57 ms; DC1..DC4 jacks not
+        observed). Outputs take 00/FF, never 0/1."""
         ack = self.set_raw(idx, 0xFF if on else 0x00)
         time.sleep(0.05)
         outs, _ = self.state()
@@ -905,7 +916,8 @@ class Hub:
     def set_all(self, on):
         """Firmware all-on (24 06 FE FE 00 28) / all-off (24 06 FF FF 00 2A); PWM/ADJ untouched.
         The firmware runs this as an RTOS task, hence the longer wait; the ack is ignored and the
-        result checked by read-back. UNTESTED on hardware."""
+        result checked by read-back. Confirmed on hardware 2026-11-22: acks 24 06 FF FF FF 2A /
+        24 06 FE FE FF 28, read-back all off / all on 150 ms later."""
         self.xfer(frame(0xFE, 0xFE) if on else frame(0xFF, 0xFF), 6)
         time.sleep(0.1)
         outs, _ = self.state()
@@ -933,9 +945,11 @@ class Hub:
 # CH340 serial bridge (the control port) is assumed to sit on that hub too, so the hub is found
 # as the CH340's parent; devices plugged into the box's USB ports are the hub's other children.
 # A USB 3 hub shows up as two hubs (a USB 2 half and a SuperSpeed half), so a "companion" hub is
-# looked for as well. All of this is inferred from the OS device tree, not from the protocol,
-# and is not yet confirmed on the real hub: `python sv241.py usb` prints what was identified so
-# it can be checked, and --usb-hub overrides it.
+# looked for as well. All of this is inferred from the OS device tree, not from the protocol.
+# On the real box (Windows, 2026-11-22) this finds a 1A40:0101 FE1.1s hub that carries the USB-C
+# output. The USB-A output's devices sit one level higher, under a VL817 USB 3 hub (2109:2817 +
+# 2109:0817) that is probably the box's own upstream hub (unconfirmed), so they are not "behind"
+# by default; `python sv241.py usb` shows the tree and --usb-hub overrides the choice.
 #
 # Each backend returns a snapshot {key: UsbDev} of the USB devices present right now; changes
 # are found by diffing snapshots taken by polling (no OS event subscription: stdlib only).
@@ -1499,34 +1513,45 @@ def usb_watch_wanted(a):
 
 
 def usb_cycle_report(w, t_off, t_on, watched):
-    """Summarise a cycle from w.history: for each device, when it disappeared after the off
-    switch (t_off, monotonic) and when it came back after the on switch (t_on); devices that did
-    not come back within `watched` s; devices that are new. Returns (lines, n_not_back)."""
-    gone, back, new = {}, {}, []
+    """Summarise a cycle from w.history (chronological): per device, what happened after the off
+    switch (t_off, monotonic) and the on switch (t_on). Returns (lines, n_not_back).
+
+    A device whose first change after t_off is a removal was present before the cycle: it is
+    reported gone, then back (first add after that) or NOT back within `watched` s; only these
+    count in n_not_back. A device whose first change is an add was not there before: it is "new",
+    or "transient" if it disappears again (and stays gone). Seen on hardware (2026-11-22, Windows):
+    a 303A:1001 (Espressif USB-Serial/JTAG) device appeared for 0.2-0.6 s after a USB output came
+    back, right before a ZWO 03C3:1Fxx accessory on the same output re-enumerated - most likely
+    that accessory's ESP32-S3 boot-time identity. Before this rule it was misreported as a device
+    that never came back."""
+    events = collections.defaultdict(list)            # key -> [(t, kind, dev, under)] after t_off
     for t, kind, d, under in w.history:
-        if t < t_off:
-            continue
-        if kind == "-" and d.key not in gone:
-            gone[d.key] = (t, d, under)
-        elif kind == "+":
-            if d.key in gone and d.key not in back:
-                back[d.key] = t
-            elif d.key not in gone:
-                new.append((t, d, under))
-    lines, missing = [], 0
-    for k, (t, d, under) in sorted(gone.items(), key=lambda x: x[1][0]):
+        if t >= t_off:
+            events[d.key].append((t, kind, d, under))
+    lines, missing, later = [], 0, []
+    for k, ev in sorted(events.items(), key=lambda x: x[1][0][0]):
+        t, kind, d, under = ev[0]
         tag = " (behind SV241 hub)" if under else ""
-        if k in back and back[k] < t_on:
-            lines.append(f"  gone +{t - t_off:.2f} s after off, back +{back[k] - t_off:.2f} s after off "
-                         f"(before the on switch): {usb_label(d)}{tag}")
-        elif k in back:
-            lines.append(f"  gone +{t - t_off:.2f} s after off, back +{back[k] - t_on:.2f} s after on: {usb_label(d)}{tag}")
-        else:
-            missing += 1
-            lines.append(f"  gone +{t - t_off:.2f} s after off, NOT back within {watched:g} s: {usb_label(d)}{tag}")
-    for t, d, under in new:
-        lines.append(f"  new  +{t - t_on:.2f} s after on (not seen before): {usb_label(d)}"
-                     + (" (behind SV241 hub)" if under else ""))
+        if kind == "-":                                # present before the cycle
+            back = next((e[0] for e in ev[1:] if e[1] == "+"), None)
+            if back is not None and back < t_on:
+                lines.append(f"  gone +{t - t_off:.2f} s after off, back +{back - t_off:.2f} s after off "
+                             f"(before the on switch): {usb_label(d)}{tag}")
+            elif back is not None:
+                lines.append(f"  gone +{t - t_off:.2f} s after off, back +{back - t_on:.2f} s after on: "
+                             f"{usb_label(d)}{tag}")
+            else:
+                missing += 1
+                lines.append(f"  gone +{t - t_off:.2f} s after off, NOT back within {watched:g} s: {usb_label(d)}{tag}")
+        else:                                          # not there before the cycle
+            ref, what = (t_on, "on") if t >= t_on else (t_off, "off")
+            gone = next((e[0] for e in ev[1:] if e[1] == "-"), None)
+            if gone is not None and ev[-1][1] == "-":
+                later.append(f"  transient +{t - ref:.2f} s after {what}, gone again after {gone - t:.2f} s "
+                             f"(boot-time identity?): {usb_label(d)}{tag}")
+            else:
+                later.append(f"  new  +{t - ref:.2f} s after {what} (not seen before): {usb_label(d)}{tag}")
+    lines += later
     if not lines:
         lines.append("  no USB devices disappeared or appeared")
     return lines, missing
@@ -1690,7 +1715,8 @@ def cmd_switch(hub, a):
     """on/off <outputs...|all>. Each output is switched and verified separately; failures are
     reported and the rest still attempted (rc 2 if any failed). "all" uses the firmware all-on/off
     command. With a USB watch window (see usb_window_watcher), host USB connects/disconnects are
-    printed with their delay after the switch, then a change count. UNTESTED on hardware."""
+    printed with their delay after the switch, then a change count. Switching and the USB
+    watch are confirmed on hardware (Windows, 2026-11-22); this command as such was not run."""
     on = a.cmd == "on"
     idxs = switch_targets(a.outputs)
     w, win = usb_window_watcher(hub, a, idxs)
@@ -1733,9 +1759,11 @@ def cmd_cycle(hub, a):
     130 if interrupted during the off time and every output was switched back on (the report is
     skipped). Ctrl+C at other moments still runs the restore (finally) and then propagates.
 
-    UNTESTED on hardware. If the box's own CH340 were powered through a switched USB output,
-    switching that output off would cut this program off from the hub with the output still off;
-    the identified hub and bridge are printed first so that can be checked (`sv241.py usb`)."""
+    Not run on hardware as a command; the switching and watching it is built from are (2026-11-22:
+    the CH340 stayed up with USB-C or USB-A off). If a box's CH340 were powered through a
+    switched USB output, switching that output off would cut this program off from the hub with
+    the output still off; the identified hub and bridge are printed first so that can be checked
+    (`sv241.py usb`)."""
     outs, _ = hub.state()
     want = switch_targets(a.outputs)
     idxs = [i for i in want if outs[i]]
@@ -2342,7 +2370,6 @@ class Keys:
 TUI_ROWS = [("out", i) for i in range(len(OUTPUTS))] + [("ch", n) for n in CHANNELS]
 # Left/Right step sizes in raw units: 0.5 V for ADJ (~8 raw), 5 % for PWM (~13 raw)
 COARSE = {"adj": round(0.5 * RAW_FULL / ADJ_VMAX), "pwm1": round(0.05 * RAW_FULL), "pwm2": round(0.05 * RAW_FULL)}
-PWM1_SOFT_MAX = round(0.80 * RAW_FULL)      # above this PWM1 tends to cycle at the cutoff edge
 DEBOUNCE_S = 0.6                            # level keys are batched into one write after this idle time
 REV, BOLD, DIM, YEL, RED, RST = "\033[7m", "\033[1m", "\033[2m", "\033[33m", "\033[31m", "\033[0m"
 KEY_HELP = ["Up/Dn j/k select   Space/Enter toggle output   a all on   x all off   r refresh   q quit",
@@ -2405,14 +2432,14 @@ class Tui:
 
     # --- actions -------------------------------------------------------------------------
     def set_output(self, i, on):
-        """Switch one output (verified by Hub.set_output). UNTESTED on hardware. With USB
+        """Switch one output (verified by Hub.set_output; not tried from the TUI on hardware). With USB
         watching on (--usb-watch or --debug), USB changes after it are timed from this switch."""
         if self.holder.usb:
             self.holder.usb.mark(f"{OUTPUTS[i]} {'on' if on else 'off'}")
         self.act(lambda: self.hub.set_output(i, on), f"{OUTPUTS[i]} switched {'ON' if on else 'off'}")
 
     def set_all(self, on):
-        """Firmware all-on / all-off. UNTESTED on hardware. Marks the USB watcher like set_output."""
+        """Firmware all-on / all-off (frames confirmed on hardware). Marks the USB watcher like set_output."""
         if self.holder.usb:
             self.holder.usb.mark(f"all {'on' if on else 'off'}")
         self.act(lambda: self.hub.set_all(on), f"all outputs switched {'ON' if on else 'off'}")
@@ -2584,7 +2611,7 @@ class Tui:
         if self.err:
             L.append(f"{RED}!! {self.err}; retrying{RST}" + ("   (values below are stale)" if s else ""))
         L.append("")
-        L.append(f"{DIM}  {'Output':<9}{'State':<7}  (switching not yet verified on hardware){RST}")
+        L.append(f"{DIM}  {'Output':<9}{'State':<7}{RST}")
         for i, n in enumerate(OUTPUTS):
             st = "—" if not s else ("ON" if s["outs"][i] else "off")
             L.append(("sel", i, f"  {n:<9}{st:<7}"))
@@ -2600,8 +2627,6 @@ class Tui:
             raw = "" if dev is None else str(dev)
             hold = fmt_level(name, h.targets[name]) if name in h.targets else "—"
             status = h.status[name] if s else ""
-            if name == "pwm1" and dev is not None and dev > PWM1_SOFT_MAX:
-                status += f"{YEL}  >80 %: cycles at cutoff edge, 70-80 % suggested{RST}"
             if name == "adj":
                 status += f"{DIM}  (volts approximate){RST}"
             L.append(("sel", len(OUTPUTS) + list(CHANNELS).index(name),
