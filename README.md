@@ -50,7 +50,7 @@ back within `--watch`) and `130` (Ctrl+C during the off time; every output was s
 on). `2` wins over `130` if an output could not be switched back on. Settings persist on the
 hub (firmware auto-saves to flash every 5 s).
 
-`on`/`off`/`all`, the FE/FF frames and the host USB watch behind `cycle` are confirmed on hardware (Windows,
+The `01` and FE/FF switching frames behind `on`/`off`/`all` and the host USB watch behind `cycle` are confirmed on hardware (Windows,
 2026-11-22); `cycle` itself and the TUI output keys have not been run on the hub (see Status).
 
 ### Debug log (`--debug FILE`, `--debug-text FILE`)
@@ -261,7 +261,7 @@ fully on or off. Use hold mode's Avg / Wh, not Max.
   - PWM1 cutoff details: writes are refused during the cutoff; on release the firmware restores
     the level saved at cutoff entry.
 
-**Untested on hardware** (simulator / synthetic data only):
+**Not yet tested on hardware** (simulator / synthetic data only):
 
 - `cycle` as a command and the TUI output keys (the frames and USB watching they use are
   confirmed).

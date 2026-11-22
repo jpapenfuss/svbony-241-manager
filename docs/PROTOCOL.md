@@ -166,7 +166,7 @@ from SHT4x ambient temperature and humidity, every 5 s:
 - A `01` write to idx 8 sets mode 1.
 - No hysteresis, so it works as a bang-bang thermostat at the limit [H]. At 100 % the lens sat
   0.2–0.6 °C under the limit and cycled (2026-11-20). At 70, 75 and 80 % (2026-11-22, ambient
-  16.7 °C, RH 80 %, limit ≈ 20.6–21.1 °C) it also cycled: 53–59 % of samples in cutoff, roughly
+  16.7 °C, RH 79–81 %, limit ≈ 20.6–21.1 °C) it also cycled: 53–59 % of samples in cutoff, roughly
   75 s on / 95 s off, lens within ±0.5 °C of the limit. A lower duty in that range does not
   avoid it.
 - No lens probe (−127 °C), or RH ≤ 0 (dew point taken as −100 °C): cutoff cannot trip.
