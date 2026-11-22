@@ -391,7 +391,8 @@ class DebugLogTests(unittest.TestCase):
             path = os.path.join(d, "trace.jsonl")
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(sv241.main(["--debug", path, "set", "pwm2", "raw:77"], hub_factory=FakeHub), 0)
-            recs = [json.loads(ln) for ln in open(path, encoding="utf-8")]
+            with open(path, encoding="utf-8") as fh:
+                recs = [json.loads(ln) for ln in fh]
         self.assertFalse(sv241.DBG.on, "closed after main()")
         evs = [r["ev"] for r in recs]
         self.assertEqual(evs[0], "start")
@@ -428,7 +429,8 @@ class DebugLogTests(unittest.TestCase):
                 t.handle("y")
             finally:
                 sv241.DBG.close()
-            recs = [json.loads(ln) for ln in open(path, encoding="utf-8")]
+            with open(path, encoding="utf-8") as fh:
+                recs = [json.loads(ln) for ln in fh]
         keys = [r["key"] for r in recs if r["ev"] == "key"]
         self.assertEqual(keys, ["x", "y"])
         self.assertTrue(any(r["ev"] == "event" and "all outputs switched off" in r["msg"] for r in recs))
@@ -664,6 +666,21 @@ class UsbCommandTests(unittest.TestCase):
         self.assertEqual(FakeHub.sim.outs[6], 0xFF, "restored")
         self.assertRegex(out, r"gone \+\d\.\d\d s after off, back \+\d\.\d\d s after on: 03C3:120E")
         self.assertIn("(behind SV241 hub)", out)
+
+    def test_cycle_restores_others_when_one_is_refused(self):
+        class Stubborn(FakeHub):
+            def set_output(self, idx, on):
+                if idx == 1 and on:
+                    raise sv241.Refused("DC2 still off (test)")
+                return super().set_output(idx, on)
+        from contextlib import redirect_stderr
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as e:
+            rc = sv241.main(["cycle", "dc1", "dc2", "dc3", "usbc", "--off-time", "0", "--watch", "0"],
+                            hub_factory=Stubborn)
+        self.assertEqual(rc, 2)
+        outs = FakeHub.sim.outs
+        self.assertEqual([outs[0], outs[1], outs[2], outs[5]], [0xFF, 0, 0xFF, 0xFF])
+        self.assertIn("STILL OFF after cycle: DC2", e.getvalue())
 
     def test_cycle_skips_outputs_that_are_off(self):
         FakeHub.sim.outs[0] = 0

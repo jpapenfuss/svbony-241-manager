@@ -1020,8 +1020,11 @@ def _win_walk():
     devnode at or below a USB node in the live Windows device tree (CfgMgr32 via ctypes).
 
     The tree is walked from the root with CM_Get_Child / CM_Get_Sibling; it only holds devices
-    that are present, so a snapshot is exactly "what is connected now". Properties are read only
-    under USB nodes (instance IDs starting USB\\), which keeps a walk to a few milliseconds.
+    that are present, so a snapshot is exactly "what is connected now". Every devnode is visited,
+    but properties are read (and tuples yielded) only for USB nodes (instance IDs starting USB\\)
+    and everything below them (HID\\, FTDIBUS\\, ... function nodes, whose friendly names carry
+    COM port numbers). CM_DRP_BASE_CONTAINERID is documented as a REG_SZ "{guid}" string; if it
+    came back otherwise, container grouping would quietly fall back to the heuristic.
     Registry codes: CM_DRP_DEVICEDESC 0x01, CM_DRP_FRIENDLYNAME 0x0D, CM_DRP_BASE_CONTAINERID 0x25."""
     global _CM
     import ctypes
@@ -1126,8 +1129,10 @@ def usb_snapshot():
     if os.name == "nt":
         try:
             return win_build(_win_walk())
-        except (OSError, AttributeError) as e:     # cfgmgr32 missing / call failure
-            raise UsbUnavailable(f"CfgMgr32 enumeration failed: {e}")
+        except UsbUnavailable:
+            raise
+        except Exception as e:                     # cfgmgr32 missing, ctypes error, ...: never fatal
+            raise UsbUnavailable(f"CfgMgr32 enumeration failed: {e!r}")
     raise UsbUnavailable(f"no USB enumeration backend for {sys.platform}")
 
 
@@ -1208,6 +1213,9 @@ def find_sv241_hubs(snap, port=None, spec=None):
         note = f"{len(ch)} CH340 bridges and none matched the port; using {ch[0].key} (pass --port or --usb-hub)"
     bridge = ch[0]
     hub = snap.get(bridge.parent)
+    if hub is None and bridge.parent is not None:
+        return [], bridge.key, (f"the parent {bridge.parent} of CH340 {bridge.key} is missing from the "
+                                "device list (still enumerating?)")
     if hub is None or hub.root:
         return [], bridge.key, (f"CH340 {bridge.key} is on a host root port, so the SV241 hub could "
                                 "not be identified; pass --usb-hub")
@@ -1241,7 +1249,7 @@ class UsbWatcher:
     sink(line) gets one human-readable line per change; every change is also a debug record
     (usb_add / usb_remove; usb_baseline, usb_hub, usb_mark, usb_error). mark(label) records a
     switching action: changes within MARK_WINDOW_S of it say "+x.xx s after <label>", and
-    `history` keeps (monotonic time, "+"/"-", UsbDev, below_hub) for cycle reports.
+    `history` keeps the last 5000 (monotonic time, "+"/"-", UsbDev, below_hub) for cycle reports.
 
     poll() can be called directly (one-shot windows) or from start()'s background thread
     (hold/TUI/usb --watch). `port` is a port name or a callable returning one (the Hub's port is
@@ -1257,7 +1265,7 @@ class UsbWatcher:
         self.prev = None                  # in-scope devices at the last poll
         self.prev_below = set()           # keys below the SV241 hub at the last poll
         self.mark_label, self.mark_t = None, None
-        self.history = []
+        self.history = collections.deque(maxlen=5000)   # bounded: hold/TUI watch for hours
         self.available = True
         self._said = None                 # last hub/unavailable note, so it is said once
         self._lock = threading.Lock()
@@ -1594,9 +1602,10 @@ def cmd_cycle(hub, a):
     Only outputs that are on are cycled (an output already off stays off; a cycle never turns on
     something that was off). If all seven are on, the firmware all-off/all-on commands are used.
     The on switch is in a finally block, so Ctrl+C or an error during the off time still restores
-    the outputs (retried for ~10 s across comm errors). Exit: 0, 2 if a switch was refused, 3 if
-    a device that disappeared did not come back within --watch s, 130 if interrupted (Ctrl+C
-    during the off time switches back on at once and skips the report).
+    the outputs (see restore(): per-output retries, ~10 s across comm errors); any output still
+    off afterwards is named on stderr. Exit: 0; 2 if a switch was refused or an output is still
+    off; 3 if a device that disappeared did not come back within --watch s; 130 if interrupted
+    (Ctrl+C during the off time switches back on at once and skips the report).
 
     NOT yet tested on hardware. If the box's own CH340 were powered through a switched USB output,
     switching that output off would cut this program off from the hub with the output still off;
@@ -1619,19 +1628,55 @@ def cmd_cycle(hub, a):
     DBG.log("cycle", outputs=[OUTPUTS[i] for i in idxs], off_time=a.off_time, watch=a.watch)
     rc = 0
 
-    def switch(on):
+    def switch_off():
         if use_all:
-            hub.set_all(on)
+            hub.set_all(False)
         else:
             for i in idxs:
-                hub.set_output(i, on)
-        print(f"{names} {'ON' if on else 'off'}", flush=True)
+                hub.set_output(i, False)
+        print(f"{names} off", flush=True)
+
+    def restore():
+        """Switch every cycled output back on; returns the indexes still off afterwards.
+        Up to 20 rounds (~10 s with the 0.5 s pause after a comm error). All-on is tried first
+        when all seven were cycled; if it doesn't take, outputs are switched one by one. Each
+        output is tried separately, so one refusal doesn't stop the rest; an output refused in 3
+        rounds is given up on. Ctrl+C during the restore is ignored so it can't be cut short."""
+        left, bulk, refused = list(idxs), use_all, collections.Counter()
+        for _ in range(20):
+            if not left:
+                break
+            try:
+                if bulk:
+                    bulk = False                    # one try; per-output on any failure
+                    hub.set_all(True)
+                    left = []
+                    continue
+                for i in list(left):
+                    try:
+                        hub.set_output(i, True)
+                        left.remove(i)
+                    except Refused as e:
+                        refused[i] += 1
+                        print(f"FAILED: {e}", file=sys.stderr)
+                if left and all(refused[i] >= 3 for i in left):
+                    break
+            except Refused as e:                    # from set_all
+                print(f"FAILED: {e}", file=sys.stderr)
+            except CommError as e:
+                hub.close()
+                print(f"comm error while switching back on (retrying): {e}", file=sys.stderr)
+                time.sleep(0.5)
+            except KeyboardInterrupt:
+                print("restoring outputs; Ctrl+C ignored", file=sys.stderr)
+        return left
 
     w.mark(f"{names} off")
     t_off = time.monotonic()
     interrupted = False
+    still_off = []
     try:
-        switch(False)
+        switch_off()
         try:
             w.watch_for(a.off_time)
         except KeyboardInterrupt:
@@ -1640,20 +1685,15 @@ def cmd_cycle(hub, a):
     finally:
         w.mark(f"{names} on")
         t_on = time.monotonic()
-        for attempt in range(20):                 # ~10 s: ride out a USB/serial hiccup
-            try:
-                switch(True)
-                break
-            except CommError as e:
-                hub.close()
-                if attempt == 19:
-                    print(f"error: could not switch {names} back on: {e}", file=sys.stderr)
-                    raise
-                time.sleep(0.5)
-            except Refused as e:
-                print(f"FAILED: {e}", file=sys.stderr)
-                rc = 2
-                break
+        still_off = restore()
+        if still_off:
+            print(f"error: STILL OFF after cycle: {', '.join(OUTPUTS[i] for i in still_off)} "
+                  "(switch them on with 'sv241.py on ...')", file=sys.stderr)
+            DBG.log("cycle_restore_failed", still_off=[OUTPUTS[i] for i in still_off])
+        else:
+            print(f"{names} ON", flush=True)
+    if still_off:
+        rc = 2
     if interrupted:
         return 130
     w.watch_for(a.watch)
@@ -1871,6 +1911,12 @@ class Holder:
             if self.a.no_clear:
                 print(line, flush=True)
 
+    def event_list(self):
+        """Copy of the recent events, taken under the lock (the USB watcher thread appends to
+        the deque, and iterating a deque while it is mutated raises RuntimeError)."""
+        with self._ev_lock:
+            return list(self.events)
+
     def start_usb(self, port=None):
         """With --usb-watch, start a background UsbWatcher whose lines become events: scope
         "hub" (devices behind the SV241 hub), or "all" with --usb-all. No-op otherwise."""
@@ -2018,8 +2064,8 @@ class Holder:
         L.append(f"\nCounts  re-pushes ADJ {c['push_adj']}  PWM1 {c['push_pwm1']}  PWM2 {c['push_pwm2']}   "
                  f"cutoffs {c['cutoff']}   push failures {c['fail_adj'] + c['fail_pwm1'] + c['fail_pwm2']}   "
                  f"hub reboots {c['reboot']}   comm errors {c['comm']}")
-        L.append("\nRecent events" + ("" if self.events else ": none"))
-        L.extend("  " + e for e in self.events)
+        L.append("\nRecent events" + ("" if self.event_list() else ": none"))
+        L.extend("  " + e for e in self.event_list())
         L.append("\nCtrl+C to quit (settings are left as they are)")
         sys.stdout.write("\033[2J\033[H" + "\n".join(L) + "\n")
         sys.stdout.flush()
@@ -2461,7 +2507,7 @@ class Tui:
             foot.append(self.msg)
         room = height - len(L) - len(foot) - 2
         if room > 0:
-            ev = list(h.events)[-room:]
+            ev = h.event_list()[-room:]
             L.append("")
             L.append(f"{DIM}  Events{RST}")
             L.extend("  " + e for e in ev)

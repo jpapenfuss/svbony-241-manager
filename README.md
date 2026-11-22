@@ -104,7 +104,8 @@ USB for `--usb-window` s after switching (default 5 s when `usbc`, `usba` or `al
 else off). Timings are "seen by" the first poll after the OS finished (de)enumerating (0.2 s
 polls in one-shot windows, 0.5 s for `usb --watch`, `--usb-interval` 1 s in hold/TUI), so read
 them as upper bounds. `cycle` only cycles outputs that are on and switches them back on even
-after Ctrl+C or an error.
+after Ctrl+C or an error (each output retried separately for ~10 s; any still off is named on
+stderr and the exit code is 2).
 
 **Check the hub identification once on the real box** (`python sv241.py usb`): it is inferred,
 not yet verified. If the wrong hub is marked, or the CH340 turns out to hang directly off a PC
