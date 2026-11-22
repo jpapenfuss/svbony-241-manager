@@ -57,8 +57,8 @@ Global options go before the command (or anywhere in a hold command line): --por
 
 One-shot exit codes: 0 success, 1 comm error, 2 hub did not take the value (e.g. PWM1 refused
 by the firmware dew cutoff) or bad argument (all arguments, including `raw` hex bytes, are
-checked before the port is opened); `cycle` also 3 (a USB device did not come back) and 130
-(Ctrl+C; outputs are switched back on first). Settings persist on the hub (it saves them to flash).
+checked before the port is opened); `cycle` also 2 if an output could not be switched back on,
+3 (a USB device did not come back) and 130 (Ctrl+C during the off time; all outputs back on). Settings persist on the hub (it saves them to flash).
 
 Debug log (--debug FILE, any command)
 -------------------------------------
@@ -1604,8 +1604,9 @@ def cmd_cycle(hub, a):
     The on switch is in a finally block, so Ctrl+C or an error during the off time still restores
     the outputs (see restore(): per-output retries, ~10 s across comm errors); any output still
     off afterwards is named on stderr. Exit: 0; 2 if a switch was refused or an output is still
-    off; 3 if a device that disappeared did not come back within --watch s; 130 if interrupted
-    (Ctrl+C during the off time switches back on at once and skips the report).
+    off (this wins over 130); 3 if a device that disappeared did not come back within --watch s;
+    130 if interrupted during the off time and every output was switched back on (the report is
+    skipped). Ctrl+C at other moments still runs the restore (finally) and then propagates.
 
     NOT yet tested on hardware. If the box's own CH340 were powered through a switched USB output,
     switching that output off would cut this program off from the hub with the output still off;
@@ -1666,7 +1667,10 @@ def cmd_cycle(hub, a):
             except CommError as e:
                 hub.close()
                 print(f"comm error while switching back on (retrying): {e}", file=sys.stderr)
-                time.sleep(0.5)
+                try:
+                    time.sleep(0.5)
+                except KeyboardInterrupt:
+                    print("restoring outputs; Ctrl+C ignored", file=sys.stderr)
             except KeyboardInterrupt:
                 print("restoring outputs; Ctrl+C ignored", file=sys.stderr)
         return left
@@ -1693,7 +1697,7 @@ def cmd_cycle(hub, a):
         else:
             print(f"{names} ON", flush=True)
     if still_off:
-        rc = 2
+        return 2                                   # takes precedence over 130: outputs not restored
     if interrupted:
         return 130
     w.watch_for(a.watch)

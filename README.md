@@ -44,8 +44,8 @@ python sv241.py off usba --usb-window 8          # watch host USB for 8 s after 
 
 Exit codes: `0` ok, `1` comm error, `2` refused by hub (e.g. PWM1 during dew cutoff) or bad
 argument (checked before the port is opened); `cycle` also `3` (a USB device that disappeared
-did not come back within `--watch`) and `130` (Ctrl+C during the off time: outputs are switched
-back on first). Settings persist on the hub (firmware auto-saves to flash every 5 s).
+did not come back within `--watch`) and `130` (Ctrl+C during the off time; every output was
+switched back on). `2` wins over `130` if an output could not be switched back on. Settings persist on the hub (firmware auto-saves to flash every 5 s).
 
 ### Debug log (`--debug FILE`)
 
