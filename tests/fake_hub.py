@@ -9,7 +9,10 @@ for exercising sv241.py without hardware. No pyserial needed.
 Modelled: 6-byte frames + sum%255 checksum (frames with a bad checksum are dropped), cmds 01 set,
 03-07 sensors (base-255, +255 offsets on temps/RH), 08 state, FE/FF all on/off, and the PWM1 dew
 cutoff (lens above limit -> PWM1 forced to 0, writes refused, previous level restored on release).
-The lens probe warms (with lag) toward ~PWM1 duty, so 100 % trips the cutoff and ~75 % does not. Not modelled: timing, banner.
+The lens probe warms (with lag) toward ~PWM1 duty, so 100 % trips the cutoff and ~75 % does not.
+Not modelled: cmds 00 (get one channel) and 02 (power), which get no reply, like any unknown
+command; reply timing; the boot banner and DTR/RTS reset. Host USB is not simulated here: tests
+substitute sv241.usb_snapshot with a fake device tree (see test_sv241.sim_snapshot).
 
 Simplifications vs real firmware (all invisible to sv241.py, which never relies on them):
   - CMD 08 reports outputs as stored (00/FF); the firmware reports 0/1. sv241 tests "!= 0".
