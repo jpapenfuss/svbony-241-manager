@@ -87,7 +87,7 @@ intervals) and `ev`:
 | `xfer` / `xfer_error` | tx, rx (hex), expect, got (short = timeout), ms / error |
 | `state` | outputs `{DC1..USB-A: bool}`, adj, pwm1, pwm2 (raw) |
 | `sensors` | raw `{"03".."07"}` (value/100, offsets included) + derived readings |
-| `ack`, `verify` | idx, target, value, result (ok/refused/noack) / target, wanted vs read-back, ok, ack (all-on/off: `mismatched` list) |
+| `ack`, `verify` | idx, target, val, result (ok/refused/noack) / target, want, got, ok, ack (all-on/off: target `all`, want, ok, `mismatched` list) |
 | `bad_reply`, `unsolicited` | rejected reply / unprompted bytes (`banner: true` = hub rebooted) |
 | `comm_error`, `refused`, `event`, `key` | errors (`where`), hold/TUI event text, TUI key + selected row |
 | `cycle`, `cycle_restore_failed` | cycle outputs, off_time, watch / outputs still off after the restore |
