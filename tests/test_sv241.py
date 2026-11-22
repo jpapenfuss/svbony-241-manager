@@ -675,6 +675,17 @@ class CycleReportTests(unittest.TestCase):
         self.assertRegex(text, r"transient \+0\.48 s after on, gone again after 0\.65 s .*303A:1001")
         self.assertNotIn("NOT back", text)
 
+    def test_flapping_device_judged_by_final_state(self):
+        w = type("W", (), {})()
+        w.history = [(100.5, "-", CAM, True), (102.0, "+", CAM, True), (104.0, "-", CAM, True)]
+        lines, missing = sv241.usb_cycle_report(w, 100.0, 106.0, 10)
+        self.assertEqual(missing, 1, lines)
+        self.assertIn("NOT back within 10 s", lines[0])
+        w.history.append((107.0, "+", CAM, True))
+        lines, missing = sv241.usb_cycle_report(w, 100.0, 106.0, 10)
+        self.assertEqual(missing, 0, lines)
+        self.assertIn("back +1.00 s after on", lines[0])
+
     def test_missing_and_new(self):
         new = dev("new", "1-2", 0x1234, 0x5678, "thing")
         w = type("W", (), {})()

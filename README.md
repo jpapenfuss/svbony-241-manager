@@ -306,6 +306,6 @@ Open:
 
 The Python files carry detailed comment blocks: a module header (purpose, usage, protocol
 summary pointing at `docs/PROTOCOL.md`), docstrings on classes and functions, and inline notes on
-non-obvious protocol details (checksum, base-255 decode, PWM1 cutoff, DTR/RTS, untested output
-switching). Keep them accurate in every change: update a comment whenever the code it describes
+non-obvious protocol details (checksum, base-255 decode, PWM1 cutoff, DTR/RTS, the unmeasured
+ADJ scale). Keep them accurate in every change: update a comment whenever the code it describes
 changes, and update `docs/PROTOCOL.md` when protocol knowledge changes.

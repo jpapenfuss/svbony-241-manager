@@ -1517,8 +1517,10 @@ def usb_cycle_report(w, t_off, t_on, watched):
     switch (t_off, monotonic) and the on switch (t_on). Returns (lines, n_not_back).
 
     A device whose first change after t_off is a removal was present before the cycle: it is
-    reported gone, then back (first add after that) or NOT back within `watched` s; only these
-    count in n_not_back. A device whose first change is an add was not there before: it is "new",
+    reported gone, then back (its last add, if its last change is an add) or NOT back within
+    `watched` s (also when it came back and dropped again); only these count in n_not_back. A
+    device that dropped before t_off and returns during the cycle counts as new (history before
+    t_off is ignored). A device whose first change is an add was not there before: it is "new",
     or "transient" if it disappears again (and stays gone). Seen on hardware (2026-11-22, Windows):
     a 303A:1001 (Espressif USB-Serial/JTAG) device appeared for 0.2-0.6 s after a USB output came
     back, right before a ZWO 03C3:1Fxx accessory on the same output re-enumerated - most likely
@@ -1533,7 +1535,8 @@ def usb_cycle_report(w, t_off, t_on, watched):
         t, kind, d, under = ev[0]
         tag = " (behind SV241 hub)" if under else ""
         if kind == "-":                                # present before the cycle
-            back = next((e[0] for e in ev[1:] if e[1] == "+"), None)
+            # Judge by the final state: a device that came back and dropped again is not back.
+            back = next((e[0] for e in reversed(ev) if e[1] == "+"), None) if ev[-1][1] == "+" else None
             if back is not None and back < t_on:
                 lines.append(f"  gone +{t - t_off:.2f} s after off, back +{back - t_off:.2f} s after off "
                              f"(before the on switch): {usb_label(d)}{tag}")
@@ -1715,8 +1718,9 @@ def cmd_switch(hub, a):
     """on/off <outputs...|all>. Each output is switched and verified separately; failures are
     reported and the rest still attempted (rc 2 if any failed). "all" uses the firmware all-on/off
     command. With a USB watch window (see usb_window_watcher), host USB connects/disconnects are
-    printed with their delay after the switch, then a change count. Switching and the USB
-    watch are confirmed on hardware (Windows, 2026-11-22); this command as such was not run."""
+    printed with their delay after the switch, then a change count. Confirmed on hardware
+    (Windows, 2026-11-22) through the same Hub.set_output / set_all calls and USB watcher; the
+    bench script drove those directly rather than through this command line."""
     on = a.cmd == "on"
     idxs = switch_targets(a.outputs)
     w, win = usb_window_watcher(hub, a, idxs)
