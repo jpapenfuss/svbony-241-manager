@@ -678,6 +678,29 @@ class DebugImpliesUsbTests(unittest.TestCase):
             sv241.main(["--debug", j, "--no-usb", "status"], hub_factory=FakeHub)
         self.assertEqual([r["ev"] for r in self.read("t.jsonl")].count("usb_baseline"), 1, "--no-usb")
 
+    def test_failing_usb_backend_never_breaks_a_command(self):
+        def broken():
+            raise OSError("backend exploded")
+        sv241.usb_snapshot = broken
+        j = os.path.join(self.dir.name, "f.jsonl")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(sv241.main(["--debug", j, "status"], hub_factory=FakeHub), 0)
+        errs = [r for r in self.read("f.jsonl") if r["ev"] == "usb_error"]
+        self.assertEqual(len(errs), 1)
+        self.assertIn("backend exploded", errs[0]["error"])
+
+    def test_same_file_for_both_formats_rejected(self):
+        from contextlib import redirect_stderr
+        j = os.path.join(self.dir.name, "same")
+        with redirect_stderr(io.StringIO()) as e:
+            self.assertEqual(sv241.main(["--debug", j, "--debug-text", j, "status"], hub_factory=FakeHub), 2)
+        self.assertIn("different files", e.getvalue())
+
+    def test_text_formatter_falls_back_to_generic(self):
+        rec = {"ts": "2026-11-22T06:00:01.234+00:00", "ev": "xfer", "tx": "24"}   # no rx/got/ms
+        self.assertRaises(KeyError, sv241.fmt_debug_text, rec)
+        self.assertEqual(sv241.fmt_debug_text(rec, generic=True), "06:00:01.234  xfer         tx=24")
+
     def test_hold_debug_implies_usb_watch(self):
         a = sv241.build_parser().parse_args(["--debug", "x", "hold"])
         self.assertTrue(sv241.usb_watch_wanted(a))

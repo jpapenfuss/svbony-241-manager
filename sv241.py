@@ -63,8 +63,9 @@ checked before the port is opened); `cycle` also 2 if an output could not be swi
 Debug log (--debug FILE and/or --debug-text FILE, any command)
 --------------------------------------------------------------
 --debug appends a JSONL trace, one JSON object per line, flushed per line ('-' = stderr, refused
-for tui). --debug-text writes the same records as readable lines ("05:48:12.877  xfer
-tx 24 06 08 00 00 32  ->  rx 24 0e 08 ...  14/14 B  3.1 ms"); use either or both.
+for tui). --debug-text writes the same records as readable lines, one per record, e.g.
+  05:48:12.877  xfer         tx 24 06 08 00 00 32  ->  rx 24 0e 08 ...  14/14 B  3.1 ms
+Use either or both (not the same file for both).
 Every record has ts (local ISO 8601 time with ms and UTC offset), mono (monotonic seconds, for
 intervals) and ev (type). Types and their main fields:
   start         argv, cmd, platform, python, pyserial version, pid       exit   rc or exception
@@ -263,7 +264,13 @@ class DebugLog:
             for sink in list(self.sinks):
                 f, path, fmt = sink
                 try:
-                    line = json.dumps(rec, ensure_ascii=False, default=str) if fmt == "jsonl" else fmt_debug_text(rec)
+                    if fmt == "jsonl":
+                        line = json.dumps(rec, ensure_ascii=False, default=str)
+                    else:
+                        try:
+                            line = fmt_debug_text(rec)
+                        except Exception:          # unexpected record shape: generic layout
+                            line = fmt_debug_text(rec, generic=True)
                     f.write(line + "\n")
                     f.flush()
                 except (OSError, ValueError) as e:
@@ -295,15 +302,17 @@ def _txt(v):
     return "-" if v is None else str(v)
 
 
-def fmt_debug_text(rec):
+def fmt_debug_text(rec, generic=False):
     """One debug record as a human-readable line: "HH:MM:SS.mmm  ev           details".
-    Common types get a tailored layout (frames, state, events, USB changes); the rest list their
-    fields as key=value. The date is left out (it is in the JSONL ts); the start record has it."""
+    Common types get a tailored layout (frames, state, events, USB changes); the rest, or every
+    type with generic=True (DebugLog's fallback if a tailored layout fails), list key=value. The date is left out (it is in the JSONL ts); the start record has it."""
     r = dict(rec)
     ts, ev = r.pop("ts", ""), r.pop("ev", "?")
     r.pop("mono", None)
     t = ts[11:23] if len(ts) >= 23 else ts
-    if ev == "xfer":
+    if generic:
+        body = " ".join(f"{k}={_txt(v)}" for k, v in r.items())
+    elif ev == "xfer":
         body = (f"tx {r['tx']}  ->  rx {r['rx'] or '(nothing)'}  {r['got']}/{r['expect']} B  {r['ms']:g} ms"
                 + ("  TIMEOUT/SHORT" if r["got"] < r["expect"] else ""))
     elif ev == "state":
@@ -1327,6 +1336,7 @@ class UsbWatcher:
         self.available = True
         self._said = None                 # last hub/unavailable note, so it is said once
         self._lock = threading.Lock()
+        self._poll_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
 
@@ -1362,14 +1372,21 @@ class UsbWatcher:
 
     def poll(self):
         """Take one snapshot and report changes since the previous one. The first successful call
-        only records the baseline. Returns [(kind, UsbDev)] with kind "+" (appeared) / "-" (gone)."""
+        only records the baseline. Returns [(kind, UsbDev)] with kind "+" (appeared) / "-" (gone).
+        Any snapshot failure (UsbUnavailable or another exception) is reported once as
+        "unavailable" and returns [], so a watcher never breaks the command it runs alongside."""
+        with self._poll_lock:                      # stop(final_poll) vs a still-running thread poll
+            return self._poll()
+
+    def _poll(self):
         snap_fn = self._snapshot or usb_snapshot
         try:
             snap = snap_fn()
-        except UsbUnavailable as e:
-            line = f"USB monitoring unavailable: {e}"
+        except Exception as e:                     # UsbUnavailable, or any backend surprise: never fatal
+            why = str(e) if isinstance(e, UsbUnavailable) else repr(e)
+            line = f"USB monitoring unavailable: {why}"
             if line != self._said:
-                DBG.log("usb_error", error=str(e))
+                DBG.log("usb_error", error=why)
             self._say(line, once=True)
             self.available = False
             return []
@@ -2838,11 +2855,16 @@ def main(argv=None, hub_factory=None):
     bytes and time values are validated before the port is opened (exit 2), so a typo never
     touches the hub. hub_factory replaces Hub (tests/fake_hub.py).
 
-    --debug FILE (JSONL) and/or --debug-text FILE (plain text) open the trace (DBG) for the run: a `start` record (argv, platform,
+    --debug FILE (JSONL) and/or --debug-text FILE (plain text, a different file) open the trace
+    (DBG) for the run: a `start` record (argv, platform,
     Python and pyserial versions) first and an `exit` record (rc, or the exception) last."""
     argv = sys.argv[1:] if argv is None else argv
     a = build_parser().parse_args(insert_default_command(argv))
     if a.debug or a.debug_text:
+        if a.debug and a.debug_text and (a.debug == a.debug_text or a.debug != "-" and a.debug_text != "-"
+                                         and os.path.abspath(a.debug) == os.path.abspath(a.debug_text)):
+            print("error: --debug and --debug-text need different files", file=sys.stderr)
+            return 2
         for path, fmt in ((a.debug, "jsonl"), (a.debug_text, "text")):
             if path == "-" and a.cmd == "tui":
                 print("error: a debug log on stderr ('-') would garble the tui screen; give a file name",
@@ -2916,11 +2938,11 @@ def _run(a, hub_factory):
     # devices behind the SV241 hub) for the duration of the command, except where a foreground
     # watcher already covers it: cycle, and on/off with a USB window.
     bg = None
-    if (debug_wanted(a) and not a.no_usb and a.cmd not in ("hold", "tui", "cycle")
-            and not (a.cmd in ("on", "off") and usb_window_s(a, switch_targets(a.outputs)) > 0)):
-        bg = UsbWatcher("hub", port=lambda: hub.port or a.port, hub_spec=a.usb_hub)
-        bg.start(0.5)
     try:
+        if (debug_wanted(a) and not a.no_usb and a.cmd not in ("hold", "tui", "cycle")
+                and not (a.cmd in ("on", "off") and usb_window_s(a, switch_targets(a.outputs)) > 0)):
+            bg = UsbWatcher("hub", port=lambda: hub.port or a.port, hub_spec=a.usb_hub)
+            bg.start(0.5)
         if a.cmd in ("hold", "tui"):
             return handler(hub, a)               # hold manages (re)opening itself
         with hub:

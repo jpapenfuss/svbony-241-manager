@@ -56,7 +56,7 @@ verifications, hold/TUI events, TUI key presses, comm errors, boot banners, and 
 `--debug -` writes to stderr (not allowed for `tui`).
 
 `--debug-text FILE` writes the same records as plain lines for reading, alone or alongside the
-JSONL file:
+JSONL file (use a different file):
 
 ```
 06:20:09.994  xfer         tx 24 06 01 01 00 2c  ->  rx 24 06 01 01 ff 2c  6/6 B  0.8 ms
