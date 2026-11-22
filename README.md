@@ -21,7 +21,7 @@ Protocol reference: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 ## Usage
 
 Global options go before the command: `--port COM6`, `--timeout 0.4`, `--debug FILE`,
-`--usb-hub SPEC`.
+`--debug-text FILE`, `--no-usb`, `--usb-hub SPEC`.
 
 ### One-shot commands
 
@@ -47,13 +47,29 @@ argument (checked before the port is opened); `cycle` also `3` (a USB device tha
 did not come back within `--watch`) and `130` (Ctrl+C during the off time; every output was
 switched back on). `2` wins over `130` if an output could not be switched back on. Settings persist on the hub (firmware auto-saves to flash every 5 s).
 
-### Debug log (`--debug FILE`)
+### Debug log (`--debug FILE`, `--debug-text FILE`)
 
 Works with every command, including `hold` and `tui`. Appends a JSONL trace (one JSON object
 per line, flushed per line, so it survives a kill): every serial exchange with tx/rx hex and
 round-trip ms, decoded state and sensor values (raw and derived), write acks and read-back
 verifications, hold/TUI events, TUI key presses, comm errors, boot banners, and USB changes.
 `--debug -` writes to stderr (not allowed for `tui`).
+
+`--debug-text FILE` writes the same records as plain lines for reading, alone or alongside the
+JSONL file:
+
+```
+06:20:09.994  xfer         tx 24 06 01 01 00 2c  ->  rx 24 06 01 01 ff 2c  6/6 B  0.8 ms
+06:20:10.044  state        outputs DC1=on DC2=off DC3=on DC4=on DC5=on USB-C=on USB-A=on  adj=198 pwm1=253 pwm2=253
+06:20:10.044  verify       target=DC2 want=False got=False ok=True ack=ok
+06:20:11.310  usb_remove   - 03c3:120e ZWO ASI120MM [1-2.3] behind SV241 hub  +0.42 s after USB-A off
+```
+
+Either debug option **turns on host USB monitoring** (see below) unless `--no-usb` is given:
+`hold`/`tui` behave as with `--usb-watch` (changes also show in the event list), and the other
+serial commands run a silent watcher of the devices behind the SV241 hub for their duration
+(baseline, changes and a final poll go to the debug log only). `cycle` and `on`/`off` with a
+USB window already watch in the foreground.
 
 Each record has `ts` (local ISO 8601, ms, UTC offset), `mono` (monotonic s; use it for
 intervals) and `ev`:
@@ -71,7 +87,8 @@ intervals) and `ev`:
 | `usb_baseline`, `usb_add`, `usb_remove`, `usb_hub`, `usb_mark`, `usb_list`, `usb_error` | USB monitoring (below) |
 
 ```
-python sv241.py --debug trace.jsonl tui
+python sv241.py --debug trace.jsonl tui          # USB changes included automatically
+python sv241.py --debug trace.jsonl --debug-text trace.log --pwm1 75
 jq -c 'select(.ev=="xfer" and .got < .expect)' trace.jsonl          # timeouts
 jq -c 'select(.ev=="usb_remove") | [.ts, .dev.name, .since_mark_s]' trace.jsonl
 python -c "import pandas as pd; print(pd.read_json('trace.jsonl', lines=True).ev.value_counts())"
@@ -94,7 +111,7 @@ the SV241". Stdlib only; snapshots of the OS device list are diffed by polling:
 python sv241.py usb                     # tree; marks SV241 hub, its CH340 and devices behind it
 python sv241.py usb --watch             # continuous connect/disconnect log behind the hub
 python sv241.py usb --watch --all       # every USB device on the PC
-python sv241.py --usb-watch --pwm1 75   # hold mode, USB changes in the event list/CSV
+python sv241.py --usb-watch --pwm1 75   # hold mode, USB changes in the event list/CSV (implied by --debug)
 python sv241.py tui --usb-watch         # TUI; changes are timed from the last output switch
 python sv241.py cycle usba              # off 3 s, on, watch 10 s, gone/back summary per device
 ```

@@ -53,16 +53,18 @@ and re-pushes any target the hub no longer reports. Every push is read back to c
 Ctrl+C exits and leaves settings as they are.
 
 Global options go before the command (or anywhere in a hold command line): --port COM6,
---timeout 0.4, --debug FILE, --usb-hub SPEC.
+--timeout 0.4, --debug FILE, --debug-text FILE, --no-usb, --usb-hub SPEC.
 
 One-shot exit codes: 0 success, 1 comm error, 2 hub did not take the value (e.g. PWM1 refused
 by the firmware dew cutoff) or bad argument (all arguments, including `raw` hex bytes, are
 checked before the port is opened); `cycle` also 2 if an output could not be switched back on,
 3 (a USB device did not come back) and 130 (Ctrl+C during the off time; all outputs back on). Settings persist on the hub (it saves them to flash).
 
-Debug log (--debug FILE, any command)
--------------------------------------
-Appends a JSONL trace, one JSON object per line, flushed per line ('-' = stderr, refused for tui).
+Debug log (--debug FILE and/or --debug-text FILE, any command)
+--------------------------------------------------------------
+--debug appends a JSONL trace, one JSON object per line, flushed per line ('-' = stderr, refused
+for tui). --debug-text writes the same records as readable lines ("05:48:12.877  xfer
+tx 24 06 08 00 00 32  ->  rx 24 0e 08 ...  14/14 B  3.1 ms"); use either or both.
 Every record has ts (local ISO 8601 time with ms and UTC offset), mono (monotonic seconds, for
 intervals) and ev (type). Types and their main fields:
   start         argv, cmd, platform, python, pyserial version, pid       exit   rc or exception
@@ -77,6 +79,10 @@ intervals) and ev (type). Types and their main fields:
   usb_baseline  scope, count, devices    usb_add / usb_remove  dev, below_hub, mark, since_mark_s
   usb_hub       hubs, bridge, note       usb_mark  label (a switch)      usb_list / usb_error
 Analyse with e.g. jq: jq -c 'select(.ev=="usb_remove")' trace.jsonl, or pandas.read_json(lines=True).
+Either debug option also turns host USB monitoring on (--no-usb turns that off): hold/tui behave as with
+--usb-watch, and other serial commands run a silent watcher of the devices behind the SV241 hub
+for their duration (baseline, changes and a final poll go to the trace only); cycle and on/off
+with a USB window already watch in the foreground.
 
 Host USB monitoring
 -------------------
@@ -202,7 +208,8 @@ ADJ_VMAX = 15.3          # assumed ADJ OUT volts at RAW_FULL (linear scale; unve
 INA_SCALE = 15.57        # vendor app's INA219 current correction (implies a non-default board shunt)
 PWR_OFFSET_MW = 269.39   # vendor app's fixed power offset (mW)
 COMMANDS = ("status", "sensors", "on", "off", "set", "raw", "ports", "usb", "cycle", "hold", "tui")
-GLOBAL_OPTS = ("--port", "--timeout", "--debug", "--usb-hub")   # each takes one value
+GLOBAL_OPTS = ("--port", "--timeout", "--debug", "--debug-text", "--usb-hub")   # each takes one value
+GLOBAL_FLAGS = ("--no-usb",)                                     # global, no value
 
 
 class CommError(Exception):
@@ -217,7 +224,9 @@ class Refused(Exception):
 # Debug log (--debug FILE)
 # ------------------------------------------------------------------------------------------
 class DebugLog:
-    """Structured, timestamped trace for offline analysis: one JSON object per line (JSONL).
+    """Timestamped trace for analysis, written to one or two sinks:
+        --debug FILE       JSONL, one JSON object per line (for jq / pandas / scripts)
+        --debug-text FILE  the same records as plain text lines for reading (fmt_debug_text)
 
     Every record carries
         ts    local wall-clock time, ISO 8601 with milliseconds and UTC offset
@@ -225,53 +234,102 @@ class DebugLog:
         ev    record type (listed under "Debug log" in the module header and the README)
     plus fields specific to the type. Off by default: log() then returns at once, and the hot
     path (Hub.xfer) checks `on` before formatting hex. Thread-safe (the USB watcher thread logs
-    too). Each line is flushed as it is written, so the file is complete even if the process is
-    killed. A write error (disk full, file closed) turns logging off with one warning on stderr
+    too). Each line is flushed as it is written, so a file is complete even if the process is
+    killed. A write error (disk full, file closed) drops that sink with one warning on stderr
     rather than breaking the command being traced."""
 
     def __init__(self):
         self.on = False
-        self.f = None
-        self.path = None
+        self.sinks = []                  # [(file, path, "jsonl" | "text")]
         self._lock = threading.Lock()
 
-    def open(self, path):
-        """Start logging to `path` (appended to; "-" = stderr). Raises OSError if it can't open."""
-        self.f = sys.stderr if path == "-" else open(path, "a", encoding="utf-8")
-        self.path = path
-        self.on = True
+    def open(self, path, fmt="jsonl"):
+        """Add a sink: `path` appended to ("-" = stderr), in format "jsonl" or "text".
+        Raises OSError if it can't be opened."""
+        f = sys.stderr if path == "-" else open(path, "a", encoding="utf-8")
+        with self._lock:
+            self.sinks.append((f, path, fmt))
+            self.on = True
 
     def log(self, ev, **fields):
-        """Write one record {ts, mono, ev, **fields}; values json can't encode go through str()."""
+        """Write one record {ts, mono, ev, **fields} to every sink; values json can't encode go
+        through str()."""
         if not self.on:
             return
         rec = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
                "mono": round(time.monotonic(), 4), "ev": ev}
         rec.update(fields)
-        line = json.dumps(rec, ensure_ascii=False, default=str)
         with self._lock:
-            if not self.on:                       # closed by another thread meanwhile
-                return
-            try:
-                self.f.write(line + "\n")
-                self.f.flush()
-            except (OSError, ValueError) as e:
-                self.on = False
-                print(f"warning: debug log {self.path} stopped: {e}", file=sys.stderr)
+            for sink in list(self.sinks):
+                f, path, fmt = sink
+                try:
+                    line = json.dumps(rec, ensure_ascii=False, default=str) if fmt == "jsonl" else fmt_debug_text(rec)
+                    f.write(line + "\n")
+                    f.flush()
+                except (OSError, ValueError) as e:
+                    self.sinks.remove(sink)
+                    print(f"warning: debug log {path} stopped: {e}", file=sys.stderr)
+            self.on = bool(self.sinks)
 
     def close(self):
-        """Stop logging and close the file (never stderr). Safe to call repeatedly."""
+        """Stop logging and close the files (never stderr). Safe to call repeatedly."""
         with self._lock:
             self.on = False
-            if self.f is not None and self.f is not sys.stderr:
-                try:
-                    self.f.close()
-                except OSError:
-                    pass
-            self.f = None
+            for f, _, _ in self.sinks:
+                if f is not sys.stderr:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+            self.sinks = []
 
 
-DBG = DebugLog()   # process-wide; main() opens it for --debug, everything else just calls DBG.log
+def _txt(v):
+    """Compact plain-text rendering of a field value for fmt_debug_text()."""
+    if isinstance(v, float):
+        return f"{v:g}"
+    if isinstance(v, dict):
+        return "{" + " ".join(f"{k}={_txt(x)}" for k, x in v.items()) + "}"
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_txt(x) for x in v) + "]"
+    return "-" if v is None else str(v)
+
+
+def fmt_debug_text(rec):
+    """One debug record as a human-readable line: "HH:MM:SS.mmm  ev           details".
+    Common types get a tailored layout (frames, state, events, USB changes); the rest list their
+    fields as key=value. The date is left out (it is in the JSONL ts); the start record has it."""
+    r = dict(rec)
+    ts, ev = r.pop("ts", ""), r.pop("ev", "?")
+    r.pop("mono", None)
+    t = ts[11:23] if len(ts) >= 23 else ts
+    if ev == "xfer":
+        body = (f"tx {r['tx']}  ->  rx {r['rx'] or '(nothing)'}  {r['got']}/{r['expect']} B  {r['ms']:g} ms"
+                + ("  TIMEOUT/SHORT" if r["got"] < r["expect"] else ""))
+    elif ev == "state":
+        outs = r.pop("outputs", {})
+        body = ("outputs " + " ".join(f"{n}={'on' if v else 'off'}" for n, v in outs.items())
+                + "  " + " ".join(f"{k}={v}" for k, v in r.items()))
+    elif ev == "event":
+        body = r.get("msg", "")
+    elif ev in ("usb_add", "usb_remove"):
+        d = r.get("dev") or {}
+        body = (f"{'+' if ev == 'usb_add' else '-'} {d.get('vid') or '----'}:{d.get('pid') or '----'} "
+                f"{d.get('name', '')} [{d.get('key', '')}]"
+                + (" behind SV241 hub" if r.get("below_hub") else "")
+                + (f"  +{r['since_mark_s']:g} s after {r['mark']}" if r.get("since_mark_s") is not None else ""))
+    elif ev in ("usb_baseline", "usb_list"):
+        devs = r.pop("devices", [])
+        body = (" ".join(f"{k}={_txt(v)}" for k, v in r.items()) + f"  {len(devs)} device(s): "
+                + "; ".join(f"{d.get('name', '')} [{d.get('key', '')}]" for d in devs))
+    elif ev == "start":
+        body = f"{ts[:10]}  " + " ".join(f"{k}={_txt(v)}" for k, v in r.items())
+    else:
+        body = " ".join(f"{k}={_txt(v)}" for k, v in r.items())
+    return f"{t}  {ev:<13}{body}"
+
+
+DBG = DebugLog()   # process-wide; main() opens it for --debug/--debug-text, everything else calls DBG.log
 
 
 # ------------------------------------------------------------------------------------------
@@ -1374,11 +1432,28 @@ class UsbWatcher:
         self._thread.start()
         return self
 
-    def stop(self):
-        """Stop the background thread (if any) and wait briefly for it."""
+    def stop(self, final_poll=False):
+        """Stop the background thread (if any) and wait briefly for it. final_poll=True takes one
+        last snapshot afterwards, so a short-lived run (a one-shot command under --debug) still
+        records changes that happened after the previous poll."""
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2.0)
+        if final_poll:
+            try:
+                self.poll()
+            except Exception as e:                # same policy as the thread: never fatal
+                DBG.log("usb_error", error=repr(e))
+
+
+def debug_wanted(a):
+    """True if a debug log (--debug or --debug-text) was asked for."""
+    return bool(getattr(a, "debug", None) or getattr(a, "debug_text", None))
+
+
+def usb_watch_wanted(a):
+    """Background USB watching for hold/tui: --usb-watch, or a debug log without --no-usb."""
+    return bool(getattr(a, "usb_watch", False) or (debug_wanted(a) and not getattr(a, "no_usb", False)))
 
 
 def usb_cycle_report(w, t_off, t_on, watched):
@@ -1551,11 +1626,16 @@ def switch_targets(tokens):
     return list(range(len(OUTPUTS))) if [t.lower() for t in tokens] == ["all"] else parse_outputs(tokens)
 
 
+def usb_window_s(a, idxs):
+    """Watch window for on/off: --usb-window if given, else USB_WINDOW_S when a USB output is among
+    idxs (DC outputs can power USB devices too, but usually don't), else 0."""
+    return a.usb_window if a.usb_window is not None else (USB_WINDOW_S if set(idxs) & set(USB_OUTPUTS) else 0)
+
+
 def usb_window_watcher(hub, a, idxs):
     """UsbWatcher (scope "all", baseline taken, printing timestamped lines) for watching USB
-    changes around an on/off, or None. Window: --usb-window if given, else USB_WINDOW_S when a USB
-    output is among idxs (DC outputs can power USB devices too, but usually don't), else 0."""
-    win = a.usb_window if a.usb_window is not None else (USB_WINDOW_S if set(idxs) & set(USB_OUTPUTS) else 0)
+    changes around an on/off, or None; window from usb_window_s()."""
+    win = usb_window_s(a, idxs)
     if win <= 0:
         return None, 0
     w = UsbWatcher("all", port=lambda: hub.port or a.port, hub_spec=a.usb_hub, sink=ts_print)
@@ -1922,9 +2002,10 @@ class Holder:
             return list(self.events)
 
     def start_usb(self, port=None):
-        """With --usb-watch, start a background UsbWatcher whose lines become events: scope
-        "hub" (devices behind the SV241 hub), or "all" with --usb-all. No-op otherwise."""
-        if not getattr(self.a, "usb_watch", False):
+        """With --usb-watch, or implicitly with --debug (unless --no-usb), start a background
+        UsbWatcher whose lines become events: scope "hub" (devices behind the SV241 hub), or "all"
+        with --usb-all. No-op otherwise."""
+        if not usb_watch_wanted(self.a):
             return
         self.usb = UsbWatcher("all" if getattr(self.a, "usb_all", False) else "hub",
                               port=port or (lambda: self.hub.port or self.a.port),
@@ -2664,6 +2745,11 @@ def build_parser():
     ap.add_argument("--debug", metavar="FILE",
                     help="append a structured JSONL trace (serial frames, decodes, writes, events, USB "
                          "changes) to FILE; '-' = stderr (not with tui)")
+    ap.add_argument("--debug-text", metavar="FILE",
+                    help="the same trace as human-readable plain text lines (alone or alongside --debug); "
+                         "'-' = stderr (not with tui)")
+    ap.add_argument("--no-usb", action="store_true",
+                    help="don't monitor host USB implicitly under --debug / --debug-text")
     ap.add_argument("--usb-hub", metavar="SPEC",
                     help="SV241 USB hub override for USB monitoring: comma-separated device keys or "
                          "VID:PID (see 'usb'); default: the CH340 bridge's parent hub + USB3 companion")
@@ -2706,8 +2792,8 @@ def build_parser():
     p.add_argument("--events", type=int, default=10, help="recent events shown (default 10)")
     p.add_argument("--no-clear", action="store_true", help="no refreshing display; print events only")
     p.add_argument("--usb-watch", action="store_true",
-                   help="log host USB connects/disconnects behind the SV241 hub as events")
-    p.add_argument("--usb-all", action="store_true", help="with --usb-watch: every USB device on the host")
+                   help="log host USB connects/disconnects behind the SV241 hub as events (implied by --debug)")
+    p.add_argument("--usb-all", action="store_true", help="with USB watching: every USB device on the host")
     p.add_argument("--usb-interval", type=float, default=1.0, help="USB poll interval (default 1 s)")
     p = sub.add_parser("tui", help="interactive live display: switch outputs, change levels with keys")
     p.add_argument("--adj", type=arg_level("adj"), help="hold ADJ OUT at this value from the start")
@@ -2718,8 +2804,8 @@ def build_parser():
     p.add_argument("--csv", help="append every poll to this CSV file")
     p.add_argument("--events", type=int, default=50, help="event history kept (default 50)")
     p.add_argument("--usb-watch", action="store_true",
-                   help="log host USB connects/disconnects behind the SV241 hub as events")
-    p.add_argument("--usb-all", action="store_true", help="with --usb-watch: every USB device on the host")
+                   help="log host USB connects/disconnects behind the SV241 hub as events (implied by --debug)")
+    p.add_argument("--usb-all", action="store_true", help="with USB watching: every USB device on the host")
     p.add_argument("--usb-interval", type=float, default=1.0, help="USB poll interval (default 1 s)")
     p.set_defaults(no_clear=False)
     return ap
@@ -2727,8 +2813,8 @@ def build_parser():
 
 def insert_default_command(argv):
     """Old SVBONY-hold.py command lines have no command word: slot 'hold' in after the globals.
-    Global options (GLOBAL_OPTS) may also appear among hold options (e.g. --pwm1 40 --port COM6),
-    so move them to the front."""
+    Global options (GLOBAL_OPTS, GLOBAL_FLAGS) may also appear among hold options (e.g. --pwm1 40
+    --port COM6), so move them to the front."""
     argv = list(argv)
     glob, rest, i = [], [], 0
     while i < len(argv):
@@ -2737,7 +2823,7 @@ def insert_default_command(argv):
             glob += argv[i:i + 2]
             i += 2
             continue
-        if t.startswith(tuple(o + "=" for o in GLOBAL_OPTS)):
+        if t in GLOBAL_FLAGS or t.startswith(tuple(o + "=" for o in GLOBAL_OPTS)):
             glob.append(t)
         else:
             rest.append(t)
@@ -2752,19 +2838,25 @@ def main(argv=None, hub_factory=None):
     bytes and time values are validated before the port is opened (exit 2), so a typo never
     touches the hub. hub_factory replaces Hub (tests/fake_hub.py).
 
-    --debug FILE opens the JSONL trace (DBG) for the whole run: a `start` record (argv, platform,
+    --debug FILE (JSONL) and/or --debug-text FILE (plain text) open the trace (DBG) for the run: a `start` record (argv, platform,
     Python and pyserial versions) first and an `exit` record (rc, or the exception) last."""
     argv = sys.argv[1:] if argv is None else argv
     a = build_parser().parse_args(insert_default_command(argv))
-    if a.debug:
-        if a.debug == "-" and a.cmd == "tui":
-            print("error: --debug - (stderr) would garble the tui screen; give a file name", file=sys.stderr)
-            return 2
-        try:
-            DBG.open(a.debug)
-        except OSError as e:
-            print(f"error: can't open debug log {a.debug}: {e}", file=sys.stderr)
-            return 2
+    if a.debug or a.debug_text:
+        for path, fmt in ((a.debug, "jsonl"), (a.debug_text, "text")):
+            if path == "-" and a.cmd == "tui":
+                print("error: a debug log on stderr ('-') would garble the tui screen; give a file name",
+                      file=sys.stderr)
+                DBG.close()
+                return 2
+            if not path:
+                continue
+            try:
+                DBG.open(path, fmt)
+            except OSError as e:
+                print(f"error: can't open debug log {path}: {e}", file=sys.stderr)
+                DBG.close()
+                return 2
         try:
             import serial
             pyser = getattr(serial, "__version__", "?")
@@ -2819,6 +2911,15 @@ def _run(a, hub_factory):
     hub = (hub_factory or Hub)(a.port, a.timeout)
     handler = {"status": cmd_status, "sensors": cmd_sensors, "on": cmd_switch, "off": cmd_switch,
                "cycle": cmd_cycle, "set": cmd_set, "raw": cmd_raw, "hold": cmd_hold, "tui": cmd_tui}[a.cmd]
+    # --debug implies USB monitoring. hold/tui start their own watcher (Holder.start_usb, events
+    # shown on screen too). Other one-shots get a silent background watcher (debug records only,
+    # devices behind the SV241 hub) for the duration of the command, except where a foreground
+    # watcher already covers it: cycle, and on/off with a USB window.
+    bg = None
+    if (debug_wanted(a) and not a.no_usb and a.cmd not in ("hold", "tui", "cycle")
+            and not (a.cmd in ("on", "off") and usb_window_s(a, switch_targets(a.outputs)) > 0)):
+        bg = UsbWatcher("hub", port=lambda: hub.port or a.port, hub_spec=a.usb_hub)
+        bg.start(0.5)
     try:
         if a.cmd in ("hold", "tui"):
             return handler(hub, a)               # hold manages (re)opening itself
@@ -2834,6 +2935,8 @@ def _run(a, hub_factory):
         return 2
     finally:
         hub.close()
+        if bg:
+            bg.stop(final_poll=True)
 
 
 if __name__ == "__main__":

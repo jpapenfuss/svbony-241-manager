@@ -649,6 +649,63 @@ class UsbWatcherTests(unittest.TestCase):
         self.assertTrue(any("DISCONNECTED" in e and "ASI120MM" in e for e in h.events), list(h.events))
 
 
+class DebugImpliesUsbTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.orig = sv241.usb_snapshot
+        sv241.usb_snapshot = sim_snapshot
+        FakeHub.sim = FakeSerial()
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def tearDown(self):
+        sv241.usb_snapshot = self.orig
+
+    def read(self, name):
+        import json
+        with open(os.path.join(self.dir.name, name), encoding="utf-8") as fh:
+            return [json.loads(ln) for ln in fh] if name.endswith(".jsonl") else fh.read()
+
+    def test_one_shot_debug_runs_silent_usb_watcher(self):
+        j = os.path.join(self.dir.name, "t.jsonl")
+        with redirect_stdout(io.StringIO()) as o:
+            self.assertEqual(sv241.main(["--debug", j, "off", "dc2"], hub_factory=FakeHub), 0)
+        self.assertNotIn("USB", o.getvalue(), "background watcher prints nothing")
+        evs = [r["ev"] for r in self.read("t.jsonl")]
+        self.assertIn("usb_baseline", evs)
+        self.assertIn("usb_hub", evs)
+        with redirect_stdout(io.StringIO()):
+            sv241.main(["--debug", j, "--no-usb", "status"], hub_factory=FakeHub)
+        self.assertEqual([r["ev"] for r in self.read("t.jsonl")].count("usb_baseline"), 1, "--no-usb")
+
+    def test_hold_debug_implies_usb_watch(self):
+        a = sv241.build_parser().parse_args(["--debug", "x", "hold"])
+        self.assertTrue(sv241.usb_watch_wanted(a))
+        a = sv241.build_parser().parse_args(sv241.insert_default_command(["--pwm1", "40", "--no-usb", "--debug-text", "x"]))
+        self.assertFalse(sv241.usb_watch_wanted(a))
+        self.assertFalse(sv241.usb_watch_wanted(sv241.build_parser().parse_args(["hold"])))
+
+    def test_text_and_jsonl_side_by_side(self):
+        j, t = (os.path.join(self.dir.name, n) for n in ("a.jsonl", "a.log"))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(sv241.main(["--debug", j, "--debug-text", t, "--no-usb", "status"], hub_factory=FakeHub), 0)
+        recs, text = self.read("a.jsonl"), self.read("a.log")
+        self.assertEqual(len(recs), len(text.splitlines()))
+        self.assertRegex(text, r"\d\d:\d\d:\d\d\.\d{3}  xfer         tx 24 06 08 00 00 32  ->  rx 24 0e 08 .* 14/14 B")
+        self.assertIn("state        outputs DC1=on", text)
+        self.assertRegex(text.splitlines()[-1], r"exit +rc=0$")
+
+    def test_text_format_of_usb_and_short_reply(self):
+        f = sv241.fmt_debug_text
+        rec = {"ts": "2026-11-22T06:00:01.234+00:00", "mono": 1.0, "ev": "usb_remove",
+               "dev": sv241.usb_record(CAM), "below_hub": True, "mark": "USB-A off", "since_mark_s": 0.42}
+        self.assertEqual(f(rec), "06:00:01.234  usb_remove   - 03c3:120e ZWO ASI120MM [1-2.3] behind SV241 hub"
+                                 "  +0.42 s after USB-A off")
+        rec = {"ts": "2026-11-22T06:00:01.234+00:00", "ev": "xfer", "tx": "24 06 08 00 00 32", "rx": "",
+               "expect": 14, "got": 0, "ms": 400.2}
+        self.assertTrue(f(rec).endswith("rx (nothing)  0/14 B  400.2 ms  TIMEOUT/SHORT"))
+
+
 class UsbCommandTests(unittest.TestCase):
     def setUp(self):
         self.orig = sv241.usb_snapshot
