@@ -1373,10 +1373,16 @@ class UsbWatcher:
     def poll(self):
         """Take one snapshot and report changes since the previous one. The first successful call
         only records the baseline. Returns [(kind, UsbDev)] with kind "+" (appeared) / "-" (gone).
-        Any snapshot failure (UsbUnavailable or another exception) is reported once as
-        "unavailable" and returns [], so a watcher never breaks the command it runs alongside."""
+        A snapshot failure (UsbUnavailable or another exception) is reported once as
+        "unavailable"; any other exception while processing is logged (usb_error). Either way it
+        returns [], so a watcher never breaks the command it runs alongside."""
         with self._poll_lock:                      # stop(final_poll) vs a still-running thread poll
-            return self._poll()
+            try:
+                return self._poll()
+            except Exception as e:                 # hub resolution / diffing bug: log, never raise
+                DBG.log("usb_error", error=repr(e))
+                self._say(f"USB watcher error: {e!r}", once=True)
+                return []
 
     def _poll(self):
         snap_fn = self._snapshot or usb_snapshot
@@ -1452,15 +1458,13 @@ class UsbWatcher:
     def stop(self, final_poll=False):
         """Stop the background thread (if any) and wait briefly for it. final_poll=True takes one
         last snapshot afterwards, so a short-lived run (a one-shot command under --debug) still
-        records changes that happened after the previous poll."""
+        records changes that happened after the previous poll. The final poll is skipped if the
+        thread is still stuck in a poll after the 2 s join, so shutdown stays bounded."""
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2.0)
-        if final_poll:
-            try:
-                self.poll()
-            except Exception as e:                # same policy as the thread: never fatal
-                DBG.log("usb_error", error=repr(e))
+        if final_poll and not (self._thread and self._thread.is_alive()):
+            self.poll()                           # skipped if a hung thread poll still runs
 
 
 def debug_wanted(a):
