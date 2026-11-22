@@ -10,10 +10,14 @@ FakeHub). Coverage:
   PosixSerialTests the stdlib termios backend end to end over a pty pair (POSIX only)
   PortPickTests    auto-detect rules: CH340 preference, cu.* over tty.*, guarded guesses
   DebugLogTests    --debug JSONL trace: record fields, frames/acks/verifies, TUI keys, routing
+  DebugImpliesUsbTests  --debug/--debug-text turn on USB watching (silent watcher for one-shots,
+                   events for hold), --no-usb, failing USB backend, --debug-text format and
+                   fallback, same-file rejection
   UsbLinuxTests    sysfs snapshot on a fake tree: parents, tty ports, peer link, hub finding
   UsbWindowsMacTests  win_build() on fake CfgMgr32 nodes, parse_ioreg() on sample ioreg text
   UsbWatcherTests  diffing, hub scope, mark timing, whole-box unplug, background thread
-  UsbCommandTests  cycle / on-off windows / usb list+watch against the simulator, with a fake
+  UsbCommandTests  cycle (restore, skip-off, rc 3) / on-off windows / usb list+watch / time
+                   validation against the simulator, with a fake
                    host USB view in which a camera hangs off the SV241's USB-A output
 Hardware-only behaviour (real DTR/RTS reset, boot banner, sensor timing) is not covered, nor
 are the real OS USB calls (CfgMgr32 via ctypes, ioreg, a live sysfs).

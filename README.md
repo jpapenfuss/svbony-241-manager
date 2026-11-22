@@ -20,8 +20,9 @@ Protocol reference: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Usage
 
-Global options go before the command: `--port COM6`, `--timeout 0.4`, `--debug FILE`,
-`--debug-text FILE`, `--no-usb`, `--usb-hub SPEC`.
+Global options: `--port COM6`, `--timeout 0.4` (reply timeout, s), `--debug FILE`,
+`--debug-text FILE`, `--no-usb`, `--usb-hub SPEC`. They may go anywhere on the command line
+(`status --port COM6` works); they are moved in front of the command before parsing.
 
 ### One-shot commands
 
@@ -42,10 +43,14 @@ python sv241.py cycle usba [--off-time 3] [--watch 10]   # off, wait, on; report
 python sv241.py off usba --usb-window 8          # watch host USB for 8 s after switching
 ```
 
-Exit codes: `0` ok, `1` comm error, `2` refused by hub (e.g. PWM1 during dew cutoff) or bad
-argument (checked before the port is opened); `cycle` also `3` (a USB device that disappeared
-did not come back within `--watch`) and `130` (Ctrl+C during the off time; every output was
-switched back on). `2` wins over `130` if an output could not be switched back on. Settings persist on the hub (firmware auto-saves to flash every 5 s).
+Exit codes: `0` ok, `1` comm error (for `usb`: USB enumeration failed), `2` refused by hub
+(e.g. PWM1 during dew cutoff) or bad argument (levels, output names, `raw` bytes and times are
+checked before the port is opened); `cycle` also `3` (a USB device that disappeared did not come
+back within `--watch`) and `130` (Ctrl+C during the off time; every output was switched back
+on). `2` wins over `130` if an output could not be switched back on. Settings persist on the
+hub (firmware auto-saves to flash every 5 s).
+
+`on`/`off`/`cycle` are **untested on hardware** (see Status).
 
 ### Debug log (`--debug FILE`, `--debug-text FILE`)
 
@@ -68,22 +73,24 @@ JSONL file (use a different file):
 Either debug option **turns on host USB monitoring** (see below) unless `--no-usb` is given:
 `hold`/`tui` behave as with `--usb-watch` (changes also show in the event list), and the other
 serial commands run a silent watcher of the devices behind the SV241 hub for their duration
-(baseline, changes and a final poll go to the debug log only). `cycle` and `on`/`off` with a
-USB window already watch in the foreground.
+(0.5 s polls; baseline, changes and a final poll go to the debug log only). `cycle` and
+`on`/`off` with a USB window already watch in the foreground. `--no-usb` only cancels this
+implicit watching; explicit `--usb-watch`, `--usb-window` and `cycle` still watch.
 
 Each record has `ts` (local ISO 8601, ms, UTC offset), `mono` (monotonic s; use it for
 intervals) and `ev`:
 
 | `ev` | Fields |
 | --- | --- |
-| `start` / `exit` | argv, platform, Python/pyserial versions / rc or exception |
+| `start` / `exit` | argv, cmd, platform, os_name, Python/pyserial versions, pid / rc or exception |
 | `port_open` / `port_close` | port, auto-detected?, backend (pyserial / termios) |
 | `xfer` / `xfer_error` | tx, rx (hex), expect, got (short = timeout), ms / error |
 | `state` | outputs `{DC1..USB-A: bool}`, adj, pwm1, pwm2 (raw) |
 | `sensors` | raw `{"03".."07"}` (value/100, offsets included) + derived readings |
-| `ack`, `verify` | write target, value, ack result / wanted vs read-back |
+| `ack`, `verify` | idx, target, value, result (ok/refused/noack) / target, wanted vs read-back, ok, ack (all-on/off: `mismatched` list) |
 | `bad_reply`, `unsolicited` | rejected reply / unprompted bytes (`banner: true` = hub rebooted) |
-| `comm_error`, `refused`, `event`, `key`, `cycle` | errors, hold/TUI events, TUI keys, cycle parameters |
+| `comm_error`, `refused`, `event`, `key` | errors (`where`), hold/TUI event text, TUI key + selected row |
+| `cycle`, `cycle_restore_failed` | cycle outputs, off_time, watch / outputs still off after the restore |
 | `usb_baseline`, `usb_add`, `usb_remove`, `usb_hub`, `usb_mark`, `usb_list`, `usb_error` | USB monitoring (below) |
 
 ```
@@ -119,13 +126,14 @@ python sv241.py cycle usba              # off 3 s, on, watch 10 s, gone/back sum
 `usb` never opens the serial port, so it runs while NINA holds the hub. `on`/`off` watch host
 USB for `--usb-window` s after switching (default 5 s when `usbc`, `usba` or `all` is switched,
 else off). Timings are "seen by" the first poll after the OS finished (de)enumerating (0.2 s
-polls in one-shot windows, 0.5 s for `usb --watch`, `--usb-interval` 1 s in hold/TUI), so read
-them as upper bounds. `cycle` only cycles outputs that are on and switches them back on even
+polls in one-shot windows, `--interval` 0.5 s for `usb --watch`, `--usb-interval` 1 s in
+hold/TUI, 0.5 s for the silent `--debug` watcher), so read them as upper bounds. `cycle` only cycles outputs that are on and switches them back on even
 after Ctrl+C or an error (each output retried separately for ~10 s; any still off is named on
 stderr and the exit code is 2).
 
-**Check the hub identification once on the real box** (`python sv241.py usb`): it is inferred,
-not yet verified. If the wrong hub is marked, or the CH340 turns out to hang directly off a PC
+**Check the hub identification once on the real box** (`python sv241.py usb`): it is inferred
+from the OS device tree and untested on hardware, and the Windows CfgMgr32 walk has never run on
+Windows. If the wrong hub is marked, or the CH340 turns out to hang directly off a PC
 port, pass `--usb-hub` with keys or `VID:PID` values from that listing (comma-separated).
 
 ### macOS / Linux
@@ -166,8 +174,9 @@ python sv241.py --pwm1 40 --csv hub.csv   # log every poll
 python sv241.py --pwm1 40 --no-clear      # plain event log (services/redirects)
 ```
 
-Other hold flags: `--events N` (recent events shown), `--usb-watch` / `--usb-all` /
-`--usb-interval S` (see Host USB monitoring).
+`--interval` must be at least 1 s; polling faster than 5 s mostly re-reads the same sensor
+sample. Other hold flags: `--events N` (recent events shown, default 10), `--usb-watch` /
+`--usb-all` / `--usb-interval S` (see Host USB monitoring; implied by `--debug`).
 
 ### Interactive mode (TUI)
 
@@ -183,10 +192,10 @@ python sv241.py tui --hold-current --csv hub.csv
 
 | Key | Action |
 | --- | --- |
-| Up/Down, `j`/`k` | select row (7 outputs, ADJ, PWM1, PWM2) |
+| Up/Down, `j`/`k`, Tab | select row (7 outputs, ADJ, PWM1, PWM2); Tab moves down |
 | Space / Enter (output row) | toggle; switching **off** asks `y/N` |
-| Left/Right, `-`/`+` | step ADJ ~0.5 V (8 raw), PWM 5 % (13 raw, capped at 100 %) |
-| `,` / `.` | step 1 raw |
+| Left/Right, `-`/`+` (also `_`/`=`) | step ADJ ~0.5 V (8 raw, up to raw 255), PWM 5 % (13 raw, capped at 100 % = raw 253) |
+| `,` / `.` (also `<`/`>`) | step 1 raw |
 | `e` / Enter (channel row) | type a value: `12` (V), `40` (%), `raw:120`; Esc cancels |
 | `h` | hold/release the selected channel (re-pushed each poll, like hold mode) |
 | `a` / `x` | all outputs on / off (`x` asks `y/N`) |
@@ -195,7 +204,9 @@ python sv241.py tui --hold-current --csv hub.csv
 Step keys are batched: one write 0.6 s after the last press. Every write is read back; refusals
 (e.g. PWM1 during dew cutoff) and comm errors show on the message line and in the event list,
 and the display keeps running. Rows flag the open items below: output switching unverified, ADJ
-volts approximate, PWM1 above 80 % (cutoff cycling).
+volts approximate, PWM1 above 80 % (cutoff cycling). TUI flags: `--adj/--pwm1/--pwm2` (held
+from the start), `--hold-current`, `--interval` (default 2 s, min 1), `--csv`, `--events N`
+(history kept, default 50), `--usb-watch`/`--usb-all`/`--usb-interval`.
 
 Needs a real console: cmd, PowerShell or Windows Terminal. In Git Bash/mintty use
 `winpty python sv241.py tui` (native Windows Python sees no TTY there and the TUI refuses to start).
@@ -216,14 +227,20 @@ fully on or off. Use hold mode's Avg / Wh, not Max.
 
 ## Status
 
-Hardware-tested 2026-11-21 on COM6: all reads, PWM2 write/restore, hold mode, checksums,
-`0x04` = lens probe, base-255 sensor decode, PWM1 cutoff formula.
+**Tested on hardware** (2026-11-20/21, Windows, COM6, Python 3.13, pyserial 3.5): all reads,
+PWM2 write/restore, hold mode, checksums, `0x04` = lens probe, base-255 sensor decode, PWM1
+cutoff formula.
 
-TUI mode (`tui`): tested only against `tests/fake_hub.py` on Linux, not yet on the hub or on
-Windows (the `msvcrt` key path is untested).
+**Untested on hardware** (simulator / synthetic data only):
 
-macOS/Linux: termios backend tested over a pty against the simulator on Linux. Not yet run on a
-real CH340 or on macOS.
+- DC/USB output switching: `on`/`off`, all on/off, `cycle`, TUI output keys.
+- ADJ OUT volts scale (`set adj <V>`, `--adj <V>`).
+- Host USB monitoring, including SV241 hub identification on every OS and the Windows CfgMgr32
+  walk.
+- TUI mode: only against `tests/fake_hub.py` on Linux; not on the hub or on Windows (the
+  `msvcrt` key path is untested).
+- macOS/Linux termios backend: only over a pty against the simulator on Linux; not on a real
+  CH340 or on macOS.
 
 Open:
 

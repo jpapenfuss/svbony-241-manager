@@ -20,6 +20,7 @@ the original hold script (superseded by `sv241.py`), `svbony-probe.py`.
 | Bridge | CH340, VID:PID `1A86:7523` | C |
 | Line | 115200 8N1, no flow control | C |
 | DTR / RTS | Must be low **before** `open()`; asserting them resets the ESP32 (auto-reset circuit) | C |
+| DTR / RTS on POSIX | Kernel raises both on open before a program can lower them; both high together should not trip the standard two-transistor auto-reset, but untested on this hub (a boot banner afterwards would show it does) | I |
 | Settle | 0.3 s after open before the first command | C |
 | Exclusivity | One process per port: vendor app, NINA driver, scripts are mutually exclusive | C |
 | Unsolicited output | None, except a boot banner containing `SV241Pro` / `V1.3` after reset; seeing it means the hub rebooted | C, F |
@@ -66,6 +67,8 @@ The firmware dispatches 11 commands: `0x00`–`0x08`, `0xFE`, `0xFF`. Others are
 
 **Outputs use `0x00`/`0xFF`, not 0/1.** For idx 0–6, `01` accepts only `00` (off) or `FF` (on);
 anything else is refused with ack `idx, 00` and changes nothing [F]. `08` reports outputs as 0/1.
+Output switching (`01` on idx 0–6, `FE`, `FF`) is **untested on hardware**; only the firmware
+code path is known.
 DC1 on: `24 06 01 00 FF 2B`; DC1 off: `24 06 01 00 00 2B`.
 
 **All on / off.** `FE`/`FF` start an RTOS task (`TASK_SET_ALL_FORCE_ON`/`_OFF`) that switches all 7
@@ -82,7 +85,7 @@ PWM and ADJ untouched [F].
 
 | Idx | Output | GPIO | Set value (`01`) | Tag |
 | --- | --- | --- | --- | --- |
-| 0–4 | DC1–DC5 | 13, 12, 14, 27, 26 | `00` off / `FF` on | F |
+| 0–4 | DC1–DC5 | 13, 12, 14, 27, 26 | `00` off / `FF` on (idx → jack mapping not bench-checked) | F |
 | 5 | USB-C | 19 | `00` / `FF` | F |
 | 6 | USB-A | 18 | `00` / `FF` | F |
 | 7 | ADJ OUT | 25 (LEDC ch1, 40 kHz) | raw 0–255 → duty round(raw/255 × 1023) | F |
@@ -92,7 +95,8 @@ PWM and ADJ untouched [F].
 Read-back converts duty with round(duty/1023 × 255), so a write reads back unchanged [F]. Firmware
 accepts the full 0–255 range; the vendor app's 253 = 100 % and "15.3 V at 253" are app
 conventions [A]. ADJ OUT is a 40 kHz PWM into a regulator, so volts per raw step depend on board
-hardware and cannot be read from firmware [F, I].
+hardware and cannot be read from firmware [F, I]; the 15.3 V @ 253 linear scale `sv241.py` uses
+is **untested on hardware**.
 
 NVS namespace `my-storage`: `gpio_1`…`gpio_6`, `gpio_sw6`, `pwm_a/b/c_duty` [F]. Boot defaults
 before NVS: all outputs on, ADJ duty 0, PWM1 duty 1000/1023 (raw 249, the vendor's "97 %"), PWM2 0 [F].
@@ -181,6 +185,7 @@ subtract 4 again.
 - [ ] Bench-check an output write (`24 06 01 00 FF 2B`, then `24 06 08 00 00 32`) to confirm
       idx 0 = DC1 physically; DC/USB switching untested on hardware.
 - [ ] Measure ADJ OUT volts vs raw (not traceable in code: firmware only sets a 40 kHz duty on GPIO25).
+- [ ] Confirm the POSIX open (DTR+RTS raised together, then dropped) does not reset the ESP32.
 - [ ] Scale `02` power (1/12.5 observed vs 1/15.57 predicted by the current factor).
 - [x] `04` = lens, `05` = ambient (hardware).
 - [x] Base-255 decode, PWM1 cutoff formula, PWM2 write/read-back (hardware).

@@ -46,19 +46,23 @@ Interactive mode (live display; switch outputs and change levels with the keyboa
     step ADJ 0.5 V / PWM 5 %, ',' '.' step 1 raw (writes are sent 0.6 s after the last key);
     e or Enter on a channel types an exact value (12, 40, raw:120); h holds/releases a channel
     (re-pushed like hold mode); a all on; x all off (asks y/N); r refresh now; q quit.
+    Output switching from the TUI is as UNTESTED on hardware as on/off.
     Pure stdlib: ANSI escapes plus msvcrt (Windows) or termios (POSIX); no curses needed.
 
 Hold mode polls outputs, PWM/ADJ channels and sensors, shows them on a refreshing console display,
 and re-pushes any target the hub no longer reports. Every push is read back to confirm it took.
 Ctrl+C exits and leaves settings as they are.
 
-Global options go before the command (or anywhere in a hold command line): --port COM6,
---timeout 0.4, --debug FILE, --debug-text FILE, --no-usb, --usb-hub SPEC.
+Global options: --port COM6, --timeout 0.4, --debug FILE, --debug-text FILE, --no-usb,
+--usb-hub SPEC. They may appear anywhere on the command line; insert_default_command() moves
+them in front of the command word before argparse sees it.
 
-One-shot exit codes: 0 success, 1 comm error, 2 hub did not take the value (e.g. PWM1 refused
-by the firmware dew cutoff) or bad argument (all arguments, including `raw` hex bytes, are
-checked before the port is opened); `cycle` also 2 if an output could not be switched back on,
-3 (a USB device did not come back) and 130 (Ctrl+C during the off time; all outputs back on). Settings persist on the hub (it saves them to flash).
+Exit codes: 0 success; 1 comm error (or USB enumeration failure for `usb`); 2 hub did not take
+the value (e.g. PWM1 refused by the firmware dew cutoff) or bad argument (all arguments,
+including `raw` hex bytes and time values, are checked before the port is opened); `cycle` also
+2 if an output could not be switched back on, 3 (a USB device that disappeared did not come
+back within --watch) and 130 (Ctrl+C during the off time; all outputs switched back on; 2 wins
+if one could not be). Settings persist on the hub (firmware auto-saves to flash every 5 s).
 
 Debug log (--debug FILE and/or --debug-text FILE, any command)
 --------------------------------------------------------------
@@ -68,22 +72,25 @@ for tui). --debug-text writes the same records as readable lines, one per record
 Use either or both (not the same file for both).
 Every record has ts (local ISO 8601 time with ms and UTC offset), mono (monotonic seconds, for
 intervals) and ev (type). Types and their main fields:
-  start         argv, cmd, platform, python, pyserial version, pid       exit   rc or exception
+  start         argv, cmd, platform, os_name, python, pyserial, pid     exit   rc or exception
   port_open     port, auto, backend (pyserial/termios)                   port_close   port
   xfer          tx, rx (hex), expect, got (short = timeout), ms          xfer_error   tx, error
   state         outputs {DC1..USB-A: bool}, adj, pwm1, pwm2 (raw)        bad_reply    cmd, rx, attempt
   sensors       raw {"03".."07": value/100, offsets in}, derived readings (input_v, lens_c, ...)
-  ack           idx, target, val, result (ok/refused/noack)              verify  target, want, got, ok
+  ack           idx, target, val, result (ok/refused/noack)
+  verify        target, want, got, ok, ack (all-on/off: target=all, want, ok, mismatched)
   unsolicited   hex, text, banner (true = boot banner, hub rebooted)
   comm_error / refused   where, error                                    event   msg (hold/TUI events)
   key           key, row, prompt (TUI)                                   cycle   outputs, off_time, watch
+  cycle_restore_failed   still_off (outputs cycle could not switch back on)
   usb_baseline  scope, count, devices    usb_add / usb_remove  dev, below_hub, mark, since_mark_s
   usb_hub       hubs, bridge, note       usb_mark  label (a switch)      usb_list / usb_error
 Analyse with e.g. jq: jq -c 'select(.ev=="usb_remove")' trace.jsonl, or pandas.read_json(lines=True).
-Either debug option also turns host USB monitoring on (--no-usb turns that off): hold/tui behave as with
---usb-watch, and other serial commands run a silent watcher of the devices behind the SV241 hub
-for their duration (baseline, changes and a final poll go to the trace only); cycle and on/off
-with a USB window already watch in the foreground.
+Either debug option also turns host USB monitoring on: hold/tui behave as with --usb-watch, and
+the other serial commands run a silent watcher of the devices behind the SV241 hub for their
+duration (0.5 s polls; baseline, changes and a final poll go to the trace only). cycle and on/off
+with a USB window already watch in the foreground. --no-usb only cancels this implicit watching;
+explicit --usb-watch, --usb-window and cycle still watch.
 
 Host USB monitoring
 -------------------
@@ -91,15 +98,17 @@ See the "Host-side USB monitoring" section below for how the SV241's built-in hu
 CH340 bridge's parent hub, plus the SuperSpeed companion of a USB 3 hub) and the per-OS
 backends. Monitoring polls the OS device list and diffs it, so a timing is "seen by" the first
 poll after the OS (de)enumerated the device: one-shot windows poll every 0.2 s, `usb --watch`
-every 0.5 s, hold/TUI --usb-watch every --usb-interval (1 s). Where it is used:
+every --interval (0.5 s), hold/TUI --usb-watch every --usb-interval (1 s), the silent --debug
+watcher every 0.5 s. Where it is used:
   on/off   watch for --usb-window s after switching (default 5 s when usbc/usba/all is switched)
   cycle    off, --off-time s, on, --watch s; prints each change with its delay after the switch,
            then a gone/back summary per device (all host USB devices, those behind the hub tagged)
   usb      tree view, or --watch for a continuous log of devices behind the hub (--all: all)
   hold/tui --usb-watch adds USB changes to the event list (and CSV/debug log); in the TUI they
            are timed from the last output switch
-The hub identification is inferred from the OS device tree and NOT yet checked on the real box:
-run `sv241.py usb` once and confirm the marked hub is the SV241's (--usb-hub to override).
+The hub identification is inferred from the OS device tree and NOT yet checked on the real box,
+and the Windows CfgMgr32 walk has never run on Windows: run `sv241.py usb` once and confirm the
+marked hub is the SV241's (--usb-hub to override).
 
 Only one program can hold the serial port: close NINA's connection to the hub, the vendor app,
 or another running copy of this script first.
@@ -130,44 +139,51 @@ Protocol (firmware V1.3, disassembly-verified; full reference in docs/PROTOCOL.m
 ----------------------------------------------------------------------------------
   Frame:  24 06 cmd idx val chk        chk = sum(bytes) % 255   (0..254, never 0xFF)
   Reply:  24 len cmd payload... chk    len = payload + 4 (6, 8 or 14)
+  00 idx       get one channel (unused here; 08 reads everything at once)
   01 idx val   set: idx 0-6 outputs (val 00/FF), 7 ADJ, 8 PWM1, 9 PWM2 (val raw);
                ack 24 06 01 idx FF|00 chk (00 = refused)
+  02           INA219 power (unused: scale unclear, power is computed from V x I instead)
   03 / 04 / 05 / 06 / 07   input V / lens probe / ambient / RH / current
-  08           state: 7 output bytes, ADJ, PWM1, PWM2
+  08           state: 7 output bytes (0/1), ADJ, PWM1, PWM2 (raw 0..255)
   FE FE / FF FF            all outputs on / off
   Exchange is half-duplex: flush input, send one 6-byte frame, read one fixed-length reply.
   Bad frames (wrong checksum) are dropped silently; there is no NAK, only a missing reply.
-  Sensor payload b3..b6 is base-255, not base-256: x = ((b3*255 + b4)*255 + b5)*255 + b6,
-  value = x / 100; temperatures and RH carry a +255 offset. (The old script's big-endian decode
-  reads high by b5/100; with its empirical -255.5 / -254 offsets that came to about +0.6 °C and
-  +2.2 %RH.) The firmware's upper two bytes are not true base-255 digits,
-  but they are 0 for every value this script reads (x < 65025), so the decode is exact here.
+  Sensor payload b3..b6 is base-255, not base-256: for every value this script reads
+  (x < 65025) b3 = b4 = 0 and x = 255*b5 + b6 exactly; value = x / 100, and temperatures and
+  RH carry a +255 offset. (The firmware's upper two bytes are not true base-255 digits, which
+  only matters for large cmd 02 values.) The old script's big-endian decode reads high by
+  b5/100; with its empirical -255.5 / -254 offsets that came to about +0.6 °C and +2.2 %RH.
   DTR/RTS must be low before the port opens, or the ESP32 resets. The hub sends nothing
   unprompted except its "SV241Pro ..." boot banner, so seeing that means it rebooted.
 
-Hardware status (2026-11-21, COM6): reads, PWM2 write/read-back, hold mode, base-255 decode,
-04 = lens / 05 = ambient and the PWM1 cutoff formula are confirmed. DC/USB output switching
-(on/off, all on/off, cycle) follows the firmware disassembly but is NOT yet tested on hardware.
-Host USB monitoring is tested against simulated device trees only (sysfs, CfgMgr32, ioreg).
+Hardware status (2026-11-20/21, COM6, Windows): reads, PWM2 write/read-back, hold mode,
+checksums, base-255 decode, 04 = lens / 05 = ambient and the PWM1 cutoff formula are confirmed.
+UNTESTED on hardware: DC/USB output switching (on/off, all on/off, cycle; follows the firmware
+disassembly), the ADJ volts scale, the TUI (simulator only, msvcrt key path never run), the
+termios backend on a real CH340 and macOS, and host USB monitoring including the SV241 hub
+identification (simulated device trees only: sysfs, CfgMgr32 node lists, ioreg text).
 
-Known unknowns: the exact ADJ OUT volts-per-raw (vendor app's 15.3 V at raw 253 is used; the
-firmware only sets a 40 kHz PWM duty, so the real scale depends on the board's regulator), and
-the scale of cmd 02 (INA219 power, unused here). Use raw:N when the ADJ voltage matters.
+Known unknowns: the exact ADJ OUT volts-per-raw (UNTESTED: the vendor app's 15.3 V at raw 253,
+linear, is assumed; the firmware only sets a 40 kHz PWM duty, so the real scale depends on the
+board's regulator and needs a meter), and the scale of cmd 02 (INA219 power, unused here). Use
+raw:N when the ADJ voltage matters.
 
 Code layout (sections in file order)
 ------------------------------------
-  Debug log            DebugLog, DBG (the process-wide --debug JSONL writer)
+  Debug log            DebugLog, fmt_debug_text(), DBG (process-wide --debug/--debug-text writer)
   Protocol helpers     frame(), checksum_ok(), base255(), dew_point(), cutoff_limit()
   Port discovery       list_serial_ports(), pick_port(), PosixSerial (stdlib termios backend)
   Serial link          Hub: open/verify/close, xfer(), state()/sensors() reads, verified writes
   Host USB monitoring  UsbDev, linux_usb_snapshot / parse_ioreg / _win_walk + win_build,
-                       find_sv241_hubs(), usb_subtree(), UsbWatcher, usb_cycle_report()
+                       find_sv241_hubs(), usb_subtree(), UsbWatcher, debug_wanted() /
+                       usb_watch_wanted(), usb_cycle_report()
   Parsing/formatting   parse_level() (V / % / raw:N -> raw), fmt_level(), parse_outputs()
-  One-shot commands    cmd_status, cmd_sensors, cmd_switch, cmd_cycle, cmd_set, cmd_raw,
-                       cmd_ports, cmd_usb
+  One-shot commands    cmd_status, cmd_sensors, cmd_switch, cmd_cycle, cmd_usb, cmd_set,
+                       cmd_raw (parse_raw_bytes), cmd_ports
   Hold mode            Stat, Holder (poll, enforce, cutoff tracking, CSV, render), cmd_hold
   TUI mode             Keys (raw key reader), Tui (keyboard actions on top of Holder), cmd_tui
-  CLI                  build_parser(), insert_default_command(), main() (debug log), _run()
+  CLI                  build_parser(), insert_default_command(), main() (debug log),
+                       _run() (validation, implicit USB watcher, dispatch)
 tests/fake_hub.py simulates the hub for tests/test_sv241.py (python -m unittest discover -s tests).
 
 Requires Python 3.8+. Windows needs pyserial (pip install pyserial); on macOS and Linux it is
@@ -218,11 +234,12 @@ class CommError(Exception):
 
 
 class Refused(Exception):
-    """The hub answered but did not take a write (read-back mismatch or refusal ack). Exit code 2."""
+    """The hub answered but a write did not take: the CMD 08 read-back differs from the value
+    written (single-channel writes quote the ack result in the message). Exit code 2."""
 
 
 # ------------------------------------------------------------------------------------------
-# Debug log (--debug FILE)
+# Debug log (--debug FILE, --debug-text FILE)
 # ------------------------------------------------------------------------------------------
 class DebugLog:
     """Timestamped trace for analysis, written to one or two sinks:
@@ -305,7 +322,8 @@ def _txt(v):
 def fmt_debug_text(rec, generic=False):
     """One debug record as a human-readable line: "HH:MM:SS.mmm  ev           details".
     Common types get a tailored layout (frames, state, events, USB changes); the rest, or every
-    type with generic=True (DebugLog's fallback if a tailored layout fails), list key=value. The date is left out (it is in the JSONL ts); the start record has it."""
+    type with generic=True (DebugLog's fallback if a tailored layout fails), list key=value.
+    Only the time of day is shown; the start record also carries the date."""
     r = dict(rec)
     ts, ev = r.pop("ts", ""), r.pop("ev", "?")
     r.pop("mono", None)
@@ -862,8 +880,8 @@ class Hub:
         """Send CMD 01 (idx 0-6 output with val 00/FF, 7-9 level with raw val); return the ack:
         'ok' (24 06 01 idx FF chk), 'refused' (24 06 01 idx 00 chk, status byte 00: e.g. PWM1
         during the dew cutoff, or an output value other than 00/FF) or 'noack' (missing or
-        malformed reply). The ack alone is
-        not trusted as proof; callers that care read the state back."""
+        malformed reply). The ack alone is not trusted as proof; callers that care read the
+        state back."""
         ack = self.xfer(frame(0x01, idx, val), 6)
         if (len(ack) == 6 and ack[0] == 0x24 and ack[1] == 0x06 and ack[2] == 0x01
                 and ack[3] == idx and checksum_ok(ack)):
@@ -875,7 +893,8 @@ class Hub:
 
     def set_output(self, idx, on):
         """Switch output idx (0..6) on/off, verified via CMD 08; raises Refused on mismatch.
-        NOT yet tested on hardware (firmware-derived). Outputs take 00/FF, never 0/1."""
+        UNTESTED on hardware (firmware-derived; idx 0 = DC1 not bench-checked). Outputs take
+        00/FF, never 0/1."""
         ack = self.set_raw(idx, 0xFF if on else 0x00)
         time.sleep(0.05)
         outs, _ = self.state()
@@ -886,7 +905,7 @@ class Hub:
     def set_all(self, on):
         """Firmware all-on (24 06 FE FE 00 28) / all-off (24 06 FF FF 00 2A); PWM/ADJ untouched.
         The firmware runs this as an RTOS task, hence the longer wait; the ack is ignored and the
-        result checked by read-back. NOT yet tested on hardware."""
+        result checked by read-back. UNTESTED on hardware."""
         self.xfer(frame(0xFE, 0xFE) if on else frame(0xFF, 0xFF), 6)
         time.sleep(0.1)
         outs, _ = self.state()
@@ -1150,8 +1169,10 @@ def win_build(nodes):
     Only USB *device* nodes are kept: instance IDs USB\\VID_xxxx&PID_yyyy\\<serial or port id>
     and USB\\ROOT_HUB*; interface nodes (&MI_xx) and function nodes below them (HID\\, FTDIBUS\\,
     ...) are folded into the nearest device above, contributing any "(COMn)" in their names to its
-    `ports`. A device description in raw INF form ("@usb.inf,%id%;Name") is cut to Name. Parent = nearest USB device ancestor. Serial = last ID segment unless it contains '&'
-    (Windows generates such IDs for devices without a serial number)."""
+    `ports`. A device description in raw INF form ("@usb.inf,%id%;Name") is cut to Name.
+    Parent = nearest USB device ancestor. Serial = last ID segment unless it contains '&'
+    (Windows generates such IDs for devices without a serial number). Tested on synthetic node
+    lists only; the real CfgMgr32 output has not been seen yet."""
     nodes = list(nodes)
     info = {n[0]: n for n in nodes}
 
@@ -1654,8 +1675,9 @@ def usb_window_s(a, idxs):
 
 
 def usb_window_watcher(hub, a, idxs):
-    """UsbWatcher (scope "all", baseline taken, printing timestamped lines) for watching USB
-    changes around an on/off, or None; window from usb_window_s()."""
+    """(watcher, window_s) for watching USB changes around an on/off. watcher is a UsbWatcher
+    (scope "all", baseline taken, printing timestamped lines), or None when the window is 0 or
+    USB enumeration is unavailable; window_s comes from usb_window_s()."""
     win = usb_window_s(a, idxs)
     if win <= 0:
         return None, 0
@@ -1668,7 +1690,7 @@ def cmd_switch(hub, a):
     """on/off <outputs...|all>. Each output is switched and verified separately; failures are
     reported and the rest still attempted (rc 2 if any failed). "all" uses the firmware all-on/off
     command. With a USB watch window (see usb_window_watcher), host USB connects/disconnects are
-    printed with their delay after the switch, then summarised. Untested on hardware."""
+    printed with their delay after the switch, then a change count. UNTESTED on hardware."""
     on = a.cmd == "on"
     idxs = switch_targets(a.outputs)
     w, win = usb_window_watcher(hub, a, idxs)
@@ -1701,7 +1723,9 @@ def cmd_cycle(hub, a):
     back on, and report which host USB devices disappeared and came back, with timings.
 
     Only outputs that are on are cycled (an output already off stays off; a cycle never turns on
-    something that was off). If all seven are on, the firmware all-off/all-on commands are used.
+    something that was off). If all seven are cycled, the firmware all-off/all-on commands are
+    used. The USB watcher is scope "all" (devices behind the SV241 hub are tagged); without USB
+    enumeration the cycle still runs, with no report.
     The on switch is in a finally block, so Ctrl+C or an error during the off time still restores
     the outputs (see restore(): per-output retries, ~10 s across comm errors); any output still
     off afterwards is named on stderr. Exit: 0; 2 if a switch was refused or an output is still
@@ -1709,7 +1733,7 @@ def cmd_cycle(hub, a):
     130 if interrupted during the off time and every output was switched back on (the report is
     skipped). Ctrl+C at other moments still runs the restore (finally) and then propagates.
 
-    NOT yet tested on hardware. If the box's own CH340 were powered through a switched USB output,
+    UNTESTED on hardware. If the box's own CH340 were powered through a switched USB output,
     switching that output off would cut this program off from the hub with the output still off;
     the identified hub and bridge are printed first so that can be checked (`sv241.py usb`)."""
     outs, _ = hub.state()
@@ -1979,7 +2003,8 @@ class Holder:
     the firmware restores the saved level itself when the lens cools below the limit."""
 
     def __init__(self, a, hub):
-        """a: parsed args (adj/pwm1/pwm2 targets, events, csv, no_clear, interval, hold_current)."""
+        """a: parsed args (adj/pwm1/pwm2 targets, events, csv, no_clear, interval, hold_current;
+        usb_watch/usb_all/usb_interval/usb_hub/no_usb and debug for start_usb())."""
         self.a = a
         self.hub = hub
         self.targets = {k: v for k, v in (("adj", a.adj), ("pwm1", a.pwm1), ("pwm2", a.pwm2))
@@ -2179,7 +2204,8 @@ class Holder:
     def run(self, max_polls=None):
         """Main hold loop: optionally adopt current levels as targets, then poll every
         --interval seconds until Ctrl+C (or max_polls, for tests). Starts/stops the USB watcher
-        (--usb-watch) around the loop and closes the CSV on exit."""
+        (--usb-watch, or implied by --debug/--debug-text) around the loop and closes the CSV on
+        exit."""
         if self.a.hold_current:
             _, dev = self.hub.state()
             for name in CHANNELS:
@@ -2379,14 +2405,14 @@ class Tui:
 
     # --- actions -------------------------------------------------------------------------
     def set_output(self, i, on):
-        """Switch one output (verified by Hub.set_output). Untested on hardware. With
-        --usb-watch, USB changes after it are timed from this switch."""
+        """Switch one output (verified by Hub.set_output). UNTESTED on hardware. With USB
+        watching on (--usb-watch or --debug), USB changes after it are timed from this switch."""
         if self.holder.usb:
             self.holder.usb.mark(f"{OUTPUTS[i]} {'on' if on else 'off'}")
         self.act(lambda: self.hub.set_output(i, on), f"{OUTPUTS[i]} switched {'ON' if on else 'off'}")
 
     def set_all(self, on):
-        """Firmware all-on / all-off. Untested on hardware. Marks the USB watcher like set_output."""
+        """Firmware all-on / all-off. UNTESTED on hardware. Marks the USB watcher like set_output."""
         if self.holder.usb:
             self.holder.usb.mark(f"all {'on' if on else 'off'}")
         self.act(lambda: self.hub.set_all(on), f"all outputs switched {'ON' if on else 'off'}")
@@ -2757,7 +2783,8 @@ def cmd_tui(hub, a):
 # CLI
 # ------------------------------------------------------------------------------------------
 def build_parser():
-    """argparse tree: global --port/--timeout, then one subcommand (see COMMANDS)."""
+    """argparse tree: global options (--port, --timeout, --debug, --debug-text, --no-usb,
+    --usb-hub; see GLOBAL_OPTS/GLOBAL_FLAGS), then one subcommand (see COMMANDS)."""
     ap = argparse.ArgumentParser(prog="sv241", description="Control and monitor an SVBONY SV241 Pro. "
                                  "With no command, runs 'hold'.")
     ap.add_argument("--port", help="COMx, /dev/ttyUSBx (Linux) or /dev/cu.usbserial-x / "
@@ -2833,9 +2860,11 @@ def build_parser():
 
 
 def insert_default_command(argv):
-    """Old SVBONY-hold.py command lines have no command word: slot 'hold' in after the globals.
-    Global options (GLOBAL_OPTS, GLOBAL_FLAGS) may also appear among hold options (e.g. --pwm1 40
-    --port COM6), so move them to the front."""
+    """Normalise argv for argparse, which only accepts globals before the subcommand.
+    Global options (GLOBAL_OPTS with their value, GLOBAL_FLAGS) are pulled out from anywhere
+    (e.g. `status --port COM6`, `--pwm1 40 --port COM6`) and moved to the front. If what is left
+    does not start with a command word (or -h/--help), it is an old SVBONY-hold.py command line,
+    so 'hold' is slotted in after the globals."""
     argv = list(argv)
     glob, rest, i = [], [], 0
     while i < len(argv):
@@ -2860,8 +2889,9 @@ def main(argv=None, hub_factory=None):
     touches the hub. hub_factory replaces Hub (tests/fake_hub.py).
 
     --debug FILE (JSONL) and/or --debug-text FILE (plain text, a different file) open the trace
-    (DBG) for the run: a `start` record (argv, platform,
-    Python and pyserial versions) first and an `exit` record (rc, or the exception) last."""
+    (DBG) for the run: a `start` record (argv, cmd, platform, Python and pyserial versions,
+    pid) first and an `exit` record (rc, or the exception) last. Exit 2 if both name the same
+    file, a file can't be opened, or '-' (stderr) is given for tui."""
     argv = sys.argv[1:] if argv is None else argv
     a = build_parser().parse_args(insert_default_command(argv))
     if a.debug or a.debug_text:
@@ -2905,7 +2935,10 @@ def main(argv=None, hub_factory=None):
 
 
 def _run(a, hub_factory):
-    """main() after argument parsing and debug-log setup: validate, then dispatch."""
+    """main() after argument parsing and debug-log setup: run ports/usb (no hub), validate the
+    rest (exit 2 before opening the port), start the implicit --debug USB watcher if due, then
+    dispatch. CommError -> 1, Refused -> 2; the hub is always closed and the watcher stopped
+    with a final poll."""
     try:
         if a.cmd == "ports":
             try:
